@@ -1,5 +1,8 @@
 """Exception hierarchy for CodeWiki Core."""
 
+from abc import ABC
+from dataclasses import dataclass
+
 
 class CodeWikiError(Exception):
     """Base exception for all CodeWiki Core errors."""
@@ -7,43 +10,28 @@ class CodeWikiError(Exception):
     pass
 
 
-class LLMError(CodeWikiError):
-    """Base exception for all LLM-related errors."""
+@dataclass
+class LLMError(CodeWikiError, ABC):
+    """Abstract base exception for all LLM-related errors."""
 
-    def __init__(self, provider: str, model: str, message: str):
-        """
-        Initialize LLMError.
+    provider: str
+    model: str
+    message: str
 
-        Args:
-            provider: The LLM provider name (e.g., "openai", "anthropic")
-            model: The model identifier
-            message: Error message
-        """
-        self.provider = provider
-        self.model = model
-        self.message = message
-        super().__init__(message)
+    def __post_init__(self) -> None:
+        """Initialize the Exception base class with the message."""
+        super().__init__(self.message)
 
     def __str__(self) -> str:
         """Return a string representation including provider and model info."""
         return f"LLM Error [{self.provider}/{self.model}]: {self.message}"
 
 
+@dataclass
 class RateLimitError(LLMError):
     """Exception raised when API rate limit is exceeded."""
 
-    def __init__(self, provider: str, model: str, message: str, retry_after: float | None = None):
-        """
-        Initialize RateLimitError.
-
-        Args:
-            provider: The LLM provider name
-            model: The model identifier
-            message: Error message
-            retry_after: Optional seconds to wait before retrying
-        """
-        super().__init__(provider, model, message)
-        self.retry_after = retry_after
+    retry_after: float | None = None
 
     def __str__(self) -> str:
         """Return a string representation including retry_after if available."""
@@ -53,25 +41,12 @@ class RateLimitError(LLMError):
         return base
 
 
+@dataclass
 class ContextLengthError(LLMError):
     """Exception raised when context window is exceeded."""
 
-    def __init__(
-        self, provider: str, model: str, message: str, max_tokens: int, actual_tokens: int
-    ):
-        """
-        Initialize ContextLengthError.
-
-        Args:
-            provider: The LLM provider name
-            model: The model identifier
-            message: Error message
-            max_tokens: Maximum allowed tokens
-            actual_tokens: Actual number of tokens provided
-        """
-        super().__init__(provider, model, message)
-        self.max_tokens = max_tokens
-        self.actual_tokens = actual_tokens
+    max_tokens: int
+    actual_tokens: int
 
     def __str__(self) -> str:
         """Return a string representation including token information."""
@@ -81,6 +56,7 @@ class ContextLengthError(LLMError):
         )
 
 
+@dataclass
 class ProviderUnavailableError(LLMError):
     """Exception raised when the LLM provider API is not reachable."""
 
@@ -89,6 +65,7 @@ class ProviderUnavailableError(LLMError):
         return f"Provider Unavailable [{self.provider}/{self.model}]: {self.message}"
 
 
+@dataclass
 class AuthenticationError(LLMError):
     """Exception raised when API key is invalid or authentication fails."""
 

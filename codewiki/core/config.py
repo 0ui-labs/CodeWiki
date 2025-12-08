@@ -1,6 +1,6 @@
 """Configuration management using Pydantic Settings."""
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # LLM Provider
     main_model: str = "claude-sonnet-4-20250514"
-    fallback_models: list[str] = ["gpt-4o"]
+    fallback_models: list[str] = Field(default_factory=lambda: ["gpt-4o"])
     cluster_model: str | None = None
 
     # API Keys
@@ -59,6 +59,21 @@ class Settings(BaseSettings):
             )
         return v
 
+    @model_validator(mode="after")
+    def set_cluster_model_default(self) -> "Settings":
+        """
+        Set cluster_model to main_model if not explicitly provided.
+
+        This ensures that when no cluster_model is specified, the main_model
+        is used for clustering operations.
+
+        Returns:
+            The Settings instance with cluster_model defaulted if needed
+        """
+        if self.cluster_model is None:
+            self.cluster_model = self.main_model
+        return self
+
     def get_api_key(self, provider: str) -> str:
         """
         Get the API key for a specific provider.
@@ -70,8 +85,8 @@ class Settings(BaseSettings):
             The API key for the provider
 
         Raises:
+            ValueError: If the provider name is not supported
             AuthenticationError: If the API key is missing for the provider
-            KeyError: If the provider name is invalid
         """
         from codewiki.core.errors import AuthenticationError
 
@@ -84,7 +99,10 @@ class Settings(BaseSettings):
         }
 
         if provider not in api_key_mapping:
-            raise KeyError(f"Invalid provider '{provider}'")
+            valid_providers = ", ".join(sorted(api_key_mapping.keys()))
+            raise ValueError(
+                f"Unknown provider '{provider}'. Supported providers: {valid_providers}"
+            )
 
         api_key = api_key_mapping[provider]
         if api_key is None:

@@ -1,0 +1,1 @@
+Bitte nutze folgende Skills zur umsetzung dieses Plans executing-plans, subagent-driven-development. Wir arbeiten strikt nach TDD standards.

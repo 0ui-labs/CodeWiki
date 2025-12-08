@@ -49,7 +49,12 @@ dependencies = [
     "psutil>=7.0.0",
     "PyYAML>=6.0.2",
     "mermaid-parser-py>=0.0.2",
-    "mermaid-py>=0.8.0"
+    "mermaid-py>=0.8.0",
+    "anthropic>=0.67.0",
+    "google-genai>=1.36.0",
+    "groq>=0.30.0",
+    "cerebras-cloud-sdk>=1.0.0",
+    "tiktoken>=0.7.0"
 ]
 
 [external]
@@ -81,10 +86,11 @@ Issues = "https://github.com/yourusername/codewiki/issues"
 packages = [
     "codewiki",
     "codewiki.core",
-    "codewiki.cli", 
-    "codewiki.cli.commands", 
-    "codewiki.cli.models", 
-    "codewiki.cli.utils", 
+    "codewiki.core.llm",
+    "codewiki.cli",
+    "codewiki.cli.commands",
+    "codewiki.cli.models",
+    "codewiki.cli.utils",
     "codewiki.cli.adapters",
     "codewiki.src",
     "codewiki.src.be",

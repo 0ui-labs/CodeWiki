@@ -147,7 +147,41 @@ class DocumentationGenerator:
                 graph[full_path] = child_names
 
         traverse(module_tree)
+        self._validate_no_cycles(graph)
         return graph
+
+    def _validate_no_cycles(self, graph: dict[str, list[str]]) -> None:
+        """Validate that the dependency graph has no cycles.
+
+        Uses DFS with three-color marking to detect cycles.
+
+        Args:
+            graph: Dependency graph to validate
+
+        Raises:
+            ValueError: If a cycle is detected
+        """
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[str, int] = {node: WHITE for node in graph}
+
+        def dfs(node: str, path: list[str]) -> None:
+            if color[node] == GRAY:
+                cycle = path[path.index(node):] + [node]
+                raise ValueError(f"Cycle detected in dependency graph: {' -> '.join(cycle)}")
+            if color[node] == BLACK:
+                return
+
+            color[node] = GRAY
+            path.append(node)
+            for dep in graph.get(node, []):
+                if dep in graph:
+                    dfs(dep, path)
+            path.pop()
+            color[node] = BLACK
+
+        for node in graph:
+            if color[node] == WHITE:
+                dfs(node, [])
 
     def build_overview_structure(self, module_tree: Dict[str, Any], module_path: List[str],
                                  working_dir: str) -> Dict[str, Any]:
@@ -174,8 +208,55 @@ class DocumentationGenerator:
 
         return processed_module_tree
 
+    def _collect_modules_for_processing(
+        self,
+        module_tree: Dict[str, Any],
+        components: Dict[str, Any],
+        working_dir: str,
+    ) -> List[Dict[str, Any]]:
+        """Collect all modules into a flat list with metadata for parallel processing.
+
+        Args:
+            module_tree: The hierarchical module tree
+            components: All code components
+            working_dir: Output directory for documentation
+
+        Returns:
+            List of module dicts with 'name', 'path', 'is_leaf', 'components', 'working_dir'
+        """
+        modules: List[Dict[str, Any]] = []
+
+        def traverse(node: Dict[str, Any], path: List[str]) -> None:
+            for module_name, module_info in node.items():
+                current_path = path + [module_name]
+                module_key = "/".join(current_path)
+
+                is_leaf = self.is_leaf_module(module_info)
+
+                modules.append({
+                    "name": module_key,  # Used as key by ParallelModuleProcessor
+                    "module_name": module_name,
+                    "path": current_path,
+                    "is_leaf": is_leaf,
+                    "components": module_info.get("components", []),
+                    "working_dir": working_dir,
+                    "all_components": components,
+                })
+
+                # Recursively process children
+                children = module_info.get("children", {})
+                if children and isinstance(children, dict):
+                    traverse(children, current_path)
+
+        traverse(module_tree, [])
+        return modules
+
     async def generate_module_documentation(self, components: Dict[str, Any], leaf_nodes: List[str]) -> str:
-        """Generate documentation for all modules using dynamic programming approach."""
+        """Generate documentation for all modules using parallel processing.
+
+        Uses ParallelModuleProcessor to process independent modules concurrently
+        while respecting dependencies (parents wait for children).
+        """
         # Prepare output directory
         working_dir = os.path.abspath(self.config.docs_dir)
         file_manager.ensure_directory(working_dir)
@@ -184,68 +265,70 @@ class DocumentationGenerator:
         first_module_tree_path = os.path.join(working_dir, FIRST_MODULE_TREE_FILENAME)
         module_tree = file_manager.load_json(module_tree_path)
         first_module_tree = file_manager.load_json(first_module_tree_path)
-        
-        # Get processing order (leaf modules first)
-        processing_order = self.get_processing_order(first_module_tree)
-
-        
-        # Process modules in dependency order
-        final_module_tree = module_tree
-        processed_modules = set()
 
         if len(module_tree) > 0:
-            for module_path, module_name in processing_order:
-                try:
-                    # Get the module info from the tree
-                    module_info = module_tree
-                    for path_part in module_path:
-                        module_info = module_info[path_part]
-                        if path_part != module_path[-1]:  # Not the last part
-                            module_info = module_info.get("children", {})
-                    
-                    # Skip if already processed
-                    module_key = "/".join(module_path)
-                    if module_key in processed_modules:
-                        continue
-                    
-                    # Process the module
-                    if self.is_leaf_module(module_info):
-                        self.logger.info(f"Processing leaf module: {module_key}")
-                        final_module_tree = await self.agent_orchestrator.process_module(
-                            module_name, components, module_info["components"], module_path, working_dir
-                        )
-                    else:
-                        self.logger.info(f"Processing parent module: {module_key}")
-                        final_module_tree = await self.generate_parent_module_docs(
-                            module_path, working_dir
-                        )
+            # Build dependency graph for parallel processing
+            dep_graph = self._build_dependency_graph(first_module_tree)
 
-                    processed_modules.add(module_key)
+            # Collect modules for parallel processing
+            modules = self._collect_modules_for_processing(module_tree, components, working_dir)
 
-                except Exception as e:
-                    self.logger.error(f"Failed to process module {module_key}: {str(e)}")
-                    continue
+            # Define the async processing function for each module
+            async def process_single_module(module_info: Dict[str, Any]) -> Dict[str, Any]:
+                """Process a single module (leaf or parent)."""
+                module_key = module_info["name"]
+                module_name = module_info["module_name"]
+                module_path = module_info["path"]
+                is_leaf = module_info["is_leaf"]
 
-            # Generate repo overview
-            self.logger.info(f"Generating repository overview")
-            final_module_tree = await self.generate_parent_module_docs(
-                [], working_dir
-            )
+                if is_leaf:
+                    return await self.agent_orchestrator.process_module(
+                        module_name,
+                        module_info["all_components"],
+                        module_info["components"],
+                        module_path,
+                        module_info["working_dir"],
+                    )
+                else:
+                    return await self.generate_parent_module_docs(
+                        module_path,
+                        module_info["working_dir"],
+                    )
+
+            # Process all modules in parallel (respecting dependencies)
+            self.logger.info(f"Processing {len(modules)} modules in parallel (max concurrency: {self.processor.max_concurrency})")
+            try:
+                results = await self.processor.process_modules(
+                    modules=modules,
+                    dependency_graph=dep_graph,
+                    process_fn=process_single_module,
+                )
+                self.logger.success(f"Completed processing {len(results)} modules")
+            except ExceptionGroup as eg:
+                # Log failed modules but continue with successful ones
+                for exc in eg.exceptions:
+                    self.logger.error(f"Module processing failed: {exc}")
+                # Some modules may have succeeded despite the group failure
+
+            # Generate repo overview (depends on all modules, so process last)
+            self.logger.info("Generating repository overview")
+            await self.generate_parent_module_docs([], working_dir)
+
         else:
-            self.logger.info(f"Processing whole repo because repo can fit in the context window")
+            self.logger.info("Processing whole repo because repo can fit in the context window")
             repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
-            final_module_tree = await self.agent_orchestrator.process_module(
+            await self.agent_orchestrator.process_module(
                 repo_name, components, leaf_nodes, [], working_dir
             )
 
-            # save final_module_tree to module_tree.json
-            file_manager.save_json(final_module_tree, os.path.join(working_dir, MODULE_TREE_FILENAME))
+            # save module_tree to module_tree.json
+            file_manager.save_json(module_tree, os.path.join(working_dir, MODULE_TREE_FILENAME))
 
             # rename repo_name.md to overview.md
             repo_overview_path = os.path.join(working_dir, f"{repo_name}.md")
             if os.path.exists(repo_overview_path):
                 os.rename(repo_overview_path, os.path.join(working_dir, OVERVIEW_FILENAME))
-        
+
         return working_dir
 
     async def generate_parent_module_docs(self, module_path: List[str],

@@ -80,14 +80,16 @@ async def cluster_modules(
     )
     response = llm_response.content
 
-    #parse the response
+    # parse the response
     try:
         if "<GROUPED_COMPONENTS>" not in response or "</GROUPED_COMPONENTS>" not in response:
             logger.error(f"Invalid LLM response format - missing component tags: {response[:200]}...")
             return {}
-        
+
         response_content = response.split("<GROUPED_COMPONENTS>")[1].split("</GROUPED_COMPONENTS>")[0]
-        module_tree = eval(response_content)
+        # Use ast.literal_eval for safe parsing (no arbitrary code execution)
+        import ast
+        module_tree = ast.literal_eval(response_content)
         
         if not isinstance(module_tree, dict):
             logger.error(f"Invalid module tree format - expected dict, got {type(module_tree)}")

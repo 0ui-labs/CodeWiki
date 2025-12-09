@@ -1,16 +1,18 @@
 from typing import List, Dict, Any
 from collections import defaultdict
-import logging
-logger = logging.getLogger(__name__)
 
 from codewiki.src.be.dependency_analyzer.models.core import Node
-from codewiki.src.be.llm_services import call_llm
-from codewiki.src.be.utils import count_tokens
-from codewiki.src.config import MAX_TOKEN_PER_MODULE, Config
+from codewiki.core import Settings
+from codewiki.core.llm import ResilientLLMClient
+from codewiki.core.llm.tokenizers import TokenCounter
+from codewiki.core.logging import CodeWikiLogger
+from codewiki.src.config import MAX_TOKEN_PER_MODULE
 from codewiki.src.be.prompt_template import format_cluster_prompt
 
 
-def format_potential_core_components(leaf_nodes: List[str], components: Dict[str, Node]) -> tuple[str, str]:
+def format_potential_core_components(
+    leaf_nodes: List[str], components: Dict[str, Node], logger: CodeWikiLogger
+) -> tuple[str, str]:
     """
     Format the potential core components into a string that can be used in the prompt.
     """
@@ -40,10 +42,12 @@ def format_potential_core_components(leaf_nodes: List[str], components: Dict[str
     return potential_core_components, potential_core_components_with_code
 
 
-def cluster_modules(
+async def cluster_modules(
     leaf_nodes: List[str],
     components: Dict[str, Node],
-    config: Config,
+    settings: Settings,
+    resilient_client: ResilientLLMClient,
+    logger: CodeWikiLogger,
     current_module_tree: dict[str, Any] = {},
     current_module_name: str = None,
     current_module_path: List[str] = []
@@ -51,14 +55,30 @@ def cluster_modules(
     """
     Cluster the potential core components into modules.
     """
-    potential_core_components, potential_core_components_with_code = format_potential_core_components(leaf_nodes, components)
+    potential_core_components, potential_core_components_with_code = format_potential_core_components(
+        leaf_nodes, components, logger
+    )
 
-    if count_tokens(potential_core_components_with_code) <= MAX_TOKEN_PER_MODULE:
-        logger.debug(f"Skipping clustering for {current_module_name} because the potential core components are too few: {count_tokens(potential_core_components_with_code)} tokens")
+    token_counter = TokenCounter(settings)
+    model = settings.cluster_model or settings.main_model
+    token_count = token_counter.count(potential_core_components_with_code, model)
+
+    if token_count <= MAX_TOKEN_PER_MODULE:
+        logger.debug(
+            f"Skipping clustering for {current_module_name} because the potential core components "
+            f"are too few: {token_count} tokens"
+        )
         return {}
 
     prompt = format_cluster_prompt(potential_core_components, current_module_tree, current_module_name)
-    response = call_llm(prompt, config, model=config.cluster_model)
+
+    llm_response = await resilient_client.complete(
+        messages=[{"role": "user", "content": prompt}],
+        model=model,
+        temperature=0.0,
+        max_tokens=32768
+    )
+    response = llm_response.content
 
     #parse the response
     try:
@@ -105,7 +125,16 @@ def cluster_modules(
         
         current_module_path.append(module_name)
         module_info["children"] = {}
-        module_info["children"] = cluster_modules(valid_sub_leaf_nodes, components, config, current_module_tree, module_name, current_module_path)
+        module_info["children"] = await cluster_modules(
+            valid_sub_leaf_nodes,
+            components,
+            settings,
+            resilient_client,
+            logger,
+            current_module_tree,
+            module_name,
+            current_module_path
+        )
         current_module_path.pop()
 
     return module_tree

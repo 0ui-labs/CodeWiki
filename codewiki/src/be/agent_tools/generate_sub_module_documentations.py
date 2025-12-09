@@ -26,9 +26,9 @@ async def generate_sub_module_documentation(
 
     deps = ctx.deps
     previous_module_name = deps.current_module_name
-    
+
     # Create fallback models from config
-    fallback_models = create_fallback_models(deps.config)
+    fallback_models = create_fallback_models(deps.settings)
 
     # add the sub-module to the module tree
     value = deps.module_tree

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from codewiki.src.be.dependency_analyzer.models.core import Node
-from codewiki.src.config import Config
+from codewiki.core import Settings
 
 @dataclass
 class CodeWikiDeps:
@@ -13,4 +13,4 @@ class CodeWikiDeps:
     module_tree: dict[str, any]
     max_depth: int
     current_depth: int
-    config: Config  # LLM configuration
+    settings: Settings  # LLM configuration

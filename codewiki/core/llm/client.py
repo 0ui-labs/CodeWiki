@@ -1,7 +1,13 @@
 """LLM client implementation with multi-provider support."""
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
 
 try:
     from anthropic import AsyncAnthropic
@@ -34,18 +40,57 @@ except ImportError:
     openai = None  # type: ignore
 
 from codewiki.core.config import Settings
-from codewiki.core.llm.tokenizers import TokenCounter
+from codewiki.core.llm.tokenizers import TokenCounter, MODEL_CONTEXT_LIMITS
+from codewiki.core.llm.pricing import calculate_cost
 from codewiki.core.errors import (
     LLMError,
     RateLimitError,
     AuthenticationError,
     ProviderUnavailableError,
+    LLMTimeoutError,
+    InvalidModelError,
 )
+
+# Common model name aliases mapped to their correct identifiers.
+# Used by validate_model() to auto-correct user-provided model names.
+# Keys are lowercase for case-insensitive lookup.
+MODEL_ALIASES: dict[str, str] = {
+    # Claude aliases (missing date suffixes)
+    "claude-opus-4.5": "claude-opus-4-5-20251101",
+    "claude-sonnet-4.5": "claude-sonnet-4-5-20251101",
+    "claude-sonnet-4": "claude-sonnet-4-20250514",
+    "claude-opus-4": "claude-opus-4-20250514",
+    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku": "claude-3-5-haiku-20241022",
+    "claude-3-opus": "claude-3-opus-20240229",
+    "claude-3-sonnet": "claude-3-sonnet-20240229",
+    "claude-3-haiku": "claude-3-haiku-20240307",
+    # OpenAI aliases
+    "gpt-4o-latest": "gpt-4o",
+    "gpt-4-turbo-latest": "gpt-4-turbo",
+    # o1/o3 aliases
+    "o1-latest": "o1",
+    "o3-latest": "o3",
+    "o3-mini-latest": "o3-mini",
+    # Gemini aliases
+    "gemini-pro": "gemini-2.5-pro",
+    "gemini-flash": "gemini-2.5-flash",
+    "gemini-2-flash": "gemini-2.0-flash",
+    "gemini-2.5": "gemini-2.5-pro",
+    "gemini-2.0": "gemini-2.0-flash",
+}
+
+# Pre-computed case-insensitive mapping for MODEL_CONTEXT_LIMITS.
+# Maps lowercase model names to their canonical cased versions.
+# Created at module load for O(1) lookup performance.
+_MODEL_CONTEXT_LIMITS_LOWER: dict[str, str] = {
+    k.lower(): k for k in MODEL_CONTEXT_LIMITS
+}
 
 
 @dataclass
 class LLMResponse:
-    """Response from LLM provider with token usage statistics.
+    """Response from LLM provider with token usage statistics and cost.
 
     Attributes:
         content: The text content returned by the LLM
@@ -53,6 +98,7 @@ class LLMResponse:
         output_tokens: Number of tokens in the output/completion
         model: Model identifier used for the request
         provider: Provider name (e.g., 'anthropic', 'openai')
+        cost: Total cost in USD for this API call
     """
 
     content: str
@@ -60,6 +106,7 @@ class LLMResponse:
     output_tokens: int
     model: str
     provider: str
+    cost: float
 
 
 class LLMClient:
@@ -74,7 +121,7 @@ class LLMClient:
             token_counter: Optional TokenCounter instance (creates new if None)
         """
         self.settings = settings
-        self.token_counter = token_counter if token_counter is not None else TokenCounter()
+        self.token_counter = token_counter if token_counter is not None else TokenCounter(settings)
 
         # Lazy-loaded provider clients
         self._anthropic: Optional[AsyncAnthropic] = None
@@ -83,12 +130,75 @@ class LLMClient:
         self._cerebras: Optional[AsyncOpenAI] = None
         self._google: Optional[object] = None  # Google uses GenerativeModel
 
+    async def close(self) -> None:
+        """
+        Close all initialized async clients and release resources.
+
+        This method is idempotent and can be called multiple times safely.
+        Errors during cleanup are collected and raised after all cleanup attempts.
+        """
+        errors = []
+
+        # Close Anthropic client
+        if self._anthropic is not None:
+            try:
+                await self._anthropic.close()
+            except Exception as e:
+                errors.append(("anthropic", e))
+            finally:
+                self._anthropic = None
+
+        # Close OpenAI client
+        if self._openai is not None:
+            try:
+                await self._openai.close()
+            except Exception as e:
+                errors.append(("openai", e))
+            finally:
+                self._openai = None
+
+        # Close Groq client (OpenAI-compatible)
+        if self._groq is not None:
+            try:
+                await self._groq.close()
+            except Exception as e:
+                errors.append(("groq", e))
+            finally:
+                self._groq = None
+
+        # Close Cerebras client (OpenAI-compatible)
+        if self._cerebras is not None:
+            try:
+                await self._cerebras.close()
+            except Exception as e:
+                errors.append(("cerebras", e))
+            finally:
+                self._cerebras = None
+
+        # Google GenerativeModel doesn't need explicit closing
+        if self._google is not None:
+            self._google = None
+
+        if errors:
+            error_msg = "; ".join(f"{client}: {str(err)}" for client, err in errors)
+            raise RuntimeError(f"Errors during client cleanup: {error_msg}")
+
+    async def __aenter__(self):
+        """Async context manager entry - returns self."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - closes all clients."""
+        await self.close()
+        return False  # Don't suppress exceptions
+
     async def complete(
         self,
         messages: list[dict],
         model: str,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        timeout: float = 60.0,
         **kwargs,
     ) -> LLMResponse:
         """
@@ -99,6 +209,7 @@ class LLMClient:
             model: Model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-20250514')
             temperature: Sampling temperature (default: 0.0)
             max_tokens: Maximum tokens to generate (default: 4096)
+            timeout: Request timeout in seconds (default: 60.0)
             **kwargs: Additional provider-specific parameters
 
         Returns:
@@ -109,7 +220,12 @@ class LLMClient:
             RateLimitError: If rate limit is exceeded
             AuthenticationError: If API key is invalid
             ProviderUnavailableError: If provider API is unreachable
+            LLMTimeoutError: If request times out
+            InvalidModelError: If model name is invalid (in strict mode)
         """
+        # Validate and potentially auto-correct model name
+        model = self.validate_model(model, strict=False)
+
         # Check context limit before making API call
         text = self._messages_to_text(messages)
         self.token_counter.check_context_limit(text, model)
@@ -120,16 +236,16 @@ class LLMClient:
         match provider:
             case "anthropic":
                 return await self._call_anthropic(
-                    messages, model, temperature, max_tokens, **kwargs
+                    messages, model, temperature, max_tokens, timeout, **kwargs
                 )
             case "openai":
-                return await self._call_openai(messages, model, temperature, max_tokens, **kwargs)
+                return await self._call_openai(messages, model, temperature, max_tokens, timeout, **kwargs)
             case "google":
-                return await self._call_google(messages, model, temperature, max_tokens, **kwargs)
+                return await self._call_google(messages, model, temperature, max_tokens, timeout, **kwargs)
             case "groq":
-                return await self._call_groq(messages, model, temperature, max_tokens, **kwargs)
+                return await self._call_groq(messages, model, temperature, max_tokens, timeout, **kwargs)
             case "cerebras":
-                return await self._call_cerebras(messages, model, temperature, max_tokens, **kwargs)
+                return await self._call_cerebras(messages, model, temperature, max_tokens, timeout, **kwargs)
             case _:
                 raise ValueError(f"Unsupported provider for model: {model}")
 
@@ -170,19 +286,110 @@ class LLMClient:
         """
         return "\n".join(msg.get("content", "") for msg in messages)
 
+    def validate_model(self, model: str, strict: bool = False) -> str:
+        """
+        Validate model name and auto-correct common aliases.
+
+        Args:
+            model: Model name to validate
+            strict: If True, raise error for unknown models. If False, warn and allow.
+
+        Returns:
+            Validated (and potentially corrected) model name
+
+        Raises:
+            InvalidModelError: If model is invalid in strict mode
+
+        Note:
+            - Known aliases are auto-corrected (e.g., "claude-sonnet-4" -> "claude-sonnet-4-20250514")
+            - Known models pass through unchanged
+            - Unknown models: warn but allow in non-strict mode, raise in strict mode
+        """
+        model_lower = model.lower()
+
+        # Check if it's a known alias (case-insensitive)
+        if model_lower in MODEL_ALIASES:
+            corrected = MODEL_ALIASES[model_lower]
+            logging.info(f"Auto-correcting model alias '{model}' to '{corrected}'")
+            return corrected
+
+        # Check if it's a known model (case-insensitive)
+        # This handles inputs like "GPT-4O" -> "gpt-4o"
+        if model_lower in _MODEL_CONTEXT_LIMITS_LOWER:
+            canonical = _MODEL_CONTEXT_LIMITS_LOWER[model_lower]
+            if canonical != model:
+                logging.debug(f"Normalized model case '{model}' to '{canonical}'")
+            return canonical
+
+        # Unknown model
+        if strict:
+            # In strict mode, raise error with suggestions
+            provider = self._detect_provider(model)
+            suggestions = self._get_model_suggestions(model, provider)
+            raise InvalidModelError(
+                provider=provider,
+                model=model,
+                message=f"Model '{model}' is not recognized. This may cause API errors.",
+                suggestions=suggestions,
+            )
+        else:
+            # In non-strict mode, warn and allow
+            logging.warning(
+                f"Model '{model}' is not in the known models list. "
+                f"This may be a custom model or could cause API errors if invalid."
+            )
+            return model
+
+    def _get_model_suggestions(self, invalid_model: str, provider: str) -> list[str] | None:
+        """
+        Get suggestions for an invalid model name.
+
+        Args:
+            invalid_model: The invalid model name
+            provider: Detected provider
+
+        Returns:
+            List of suggested model names, or None if no suggestions found
+        """
+        suggestions = []
+        invalid_lower = invalid_model.lower()
+
+        # Check aliases first
+        if invalid_lower in MODEL_ALIASES:
+            suggestions.append(MODEL_ALIASES[invalid_lower])
+
+        # Find similar models from the known list
+        for known_model in MODEL_CONTEXT_LIMITS.keys():
+            known_lower = known_model.lower()
+            # Match by provider
+            if self._detect_provider(known_model) == provider:
+                # Check if invalid model is a prefix of known model
+                if known_lower.startswith(invalid_lower):
+                    if known_model not in suggestions:
+                        suggestions.append(known_model)
+                # Check if they share common prefix (e.g., "claude-sonnet")
+                elif invalid_lower.split("-")[0:2] == known_lower.split("-")[0:2]:
+                    # Same family (e.g., both are claude-sonnet)
+                    if known_model not in suggestions:
+                        suggestions.append(known_model)
+
+        # Limit to top 5 suggestions and return None if empty
+        return suggestions[:5] if suggestions else None
+
     async def _call_anthropic(
         self,
         messages: list[dict],
         model: str,
         temperature: float,
         max_tokens: int,
+        timeout: float,
         **kwargs,
     ) -> LLMResponse:
         """Call Anthropic API."""
         if AsyncAnthropic is None:
             raise ImportError("anthropic package required for Claude models")
 
-        # Lazy-init client
+        # Lazy-init client without timeout (timeout is passed per-call)
         if self._anthropic is None:
             api_key = self.settings.get_api_key("anthropic")
             self._anthropic = AsyncAnthropic(api_key=api_key)
@@ -193,19 +400,25 @@ class LLMClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 messages=messages,
+                timeout=timeout,
                 **kwargs,
             )
 
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
+            cost = calculate_cost(model, input_tokens, output_tokens)
+
             return LLMResponse(
                 content=response.content[0].text,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 model=model,
                 provider="anthropic",
+                cost=cost,
             )
         except Exception as e:
             # Wrap exceptions in LLMError subclasses
-            self._handle_exception(e, "anthropic", model)
+            self._handle_exception(e, "anthropic", model, timeout)
 
     async def _call_openai(
         self,
@@ -213,13 +426,14 @@ class LLMClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        timeout: float,
         **kwargs,
     ) -> LLMResponse:
         """Call OpenAI API."""
         if AsyncOpenAI is None:
             raise ImportError("openai package required for OpenAI models")
 
-        # Lazy-init client
+        # Lazy-init client without timeout (timeout is passed per-call)
         if self._openai is None:
             api_key = self.settings.get_api_key("openai")
             self._openai = AsyncOpenAI(api_key=api_key)
@@ -230,18 +444,24 @@ class LLMClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 messages=messages,
+                timeout=timeout,
                 **kwargs,
             )
 
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+            cost = calculate_cost(model, input_tokens, output_tokens)
+
             return LLMResponse(
                 content=response.choices[0].message.content,
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 model=model,
                 provider="openai",
+                cost=cost,
             )
         except Exception as e:
-            self._handle_exception(e, "openai", model)
+            self._handle_exception(e, "openai", model, timeout)
 
     async def _call_google(
         self,
@@ -249,6 +469,7 @@ class LLMClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        timeout: float,
         **kwargs,
     ) -> LLMResponse:
         """Call Google Gemini API."""
@@ -280,21 +501,31 @@ class LLMClient:
                 temperature=temperature, max_output_tokens=max_tokens
             )
 
+            # Google SDK uses request_options for timeout
+            request_options = kwargs.pop("request_options", {})
+            request_options["timeout"] = timeout
+
             response = await self._google.generate_content_async(
                 contents=contents,
                 generation_config=generation_config,
+                request_options=request_options,
                 **kwargs,
             )
 
+            input_tokens = response.usage_metadata.prompt_token_count
+            output_tokens = response.usage_metadata.candidates_token_count
+            cost = calculate_cost(model, input_tokens, output_tokens)
+
             return LLMResponse(
                 content=response.text,
-                input_tokens=response.usage_metadata.prompt_token_count,
-                output_tokens=response.usage_metadata.candidates_token_count,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 model=model,
                 provider="google",
+                cost=cost,
             )
         except Exception as e:
-            self._handle_exception(e, "google", model)
+            self._handle_exception(e, "google", model, timeout)
 
     async def _call_groq(
         self,
@@ -302,16 +533,20 @@ class LLMClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        timeout: float,
         **kwargs,
     ) -> LLMResponse:
         """Call Groq API (OpenAI-compatible)."""
         if AsyncOpenAI is None:
             raise ImportError("openai package required for Groq models")
 
-        # Lazy-init client with Groq base URL
+        # Lazy-init client with Groq base URL (timeout is passed per-call)
         if self._groq is None:
             api_key = self.settings.get_api_key("groq")
-            self._groq = AsyncOpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
+            self._groq = AsyncOpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=api_key,
+            )
 
         # Remove 'groq/' prefix from model name
         model_name = model.replace("groq/", "")
@@ -322,18 +557,24 @@ class LLMClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 messages=messages,
+                timeout=timeout,
                 **kwargs,
             )
 
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+            cost = calculate_cost(model, input_tokens, output_tokens)
+
             return LLMResponse(
                 content=response.choices[0].message.content,
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 model=model,
                 provider="groq",
+                cost=cost,
             )
         except Exception as e:
-            self._handle_exception(e, "groq", model)
+            self._handle_exception(e, "groq", model, timeout)
 
     async def _call_cerebras(
         self,
@@ -341,16 +582,20 @@ class LLMClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        timeout: float,
         **kwargs,
     ) -> LLMResponse:
         """Call Cerebras API (OpenAI-compatible)."""
         if AsyncOpenAI is None:
             raise ImportError("openai package required for Cerebras models")
 
-        # Lazy-init client with Cerebras base URL
+        # Lazy-init client with Cerebras base URL (timeout is passed per-call)
         if self._cerebras is None:
             api_key = self.settings.get_api_key("cerebras")
-            self._cerebras = AsyncOpenAI(base_url="https://api.cerebras.ai/v1", api_key=api_key)
+            self._cerebras = AsyncOpenAI(
+                base_url="https://api.cerebras.ai/v1",
+                api_key=api_key,
+            )
 
         # Remove 'cerebras/' prefix from model name
         model_name = model.replace("cerebras/", "")
@@ -361,20 +606,26 @@ class LLMClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 messages=messages,
+                timeout=timeout,
                 **kwargs,
             )
 
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+            cost = calculate_cost(model, input_tokens, output_tokens)
+
             return LLMResponse(
                 content=response.choices[0].message.content,
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 model=model,
                 provider="cerebras",
+                cost=cost,
             )
         except Exception as e:
-            self._handle_exception(e, "cerebras", model)
+            self._handle_exception(e, "cerebras", model, timeout)
 
-    def _handle_exception(self, e: Exception, provider: str, model: str) -> None:
+    def _handle_exception(self, e: Exception, provider: str, model: str, timeout: float) -> None:
         """
         Handle and wrap provider exceptions.
 
@@ -382,6 +633,7 @@ class LLMClient:
             e: Original exception
             provider: Provider name
             model: Model name
+            timeout: Timeout value used for the request
 
         Raises:
             Appropriate LLMError subclass
@@ -389,6 +641,15 @@ class LLMClient:
         # Re-raise if already an LLMError
         if isinstance(e, LLMError):
             raise e
+
+        # Handle timeout exceptions from httpx (used by Anthropic and OpenAI SDKs)
+        if httpx and isinstance(e, httpx.TimeoutException):
+            raise LLMTimeoutError(
+                provider=provider,
+                model=model,
+                message=f"Request timed out after {timeout}s",
+                timeout=timeout
+            )
 
         # Map Anthropic exceptions
         if anthropic:
@@ -413,11 +674,19 @@ class LLMClient:
 
         # Map Google exceptions
         if google_exceptions:
-            if isinstance(e, google_exceptions.ResourceExhausted):
+            # Check for deadline/timeout first
+            if hasattr(google_exceptions, 'DeadlineExceeded') and isinstance(e, google_exceptions.DeadlineExceeded):
+                raise LLMTimeoutError(
+                    provider=provider,
+                    model=model,
+                    message=f"Request timed out after {timeout}s",
+                    timeout=timeout
+                )
+            if hasattr(google_exceptions, 'ResourceExhausted') and isinstance(e, google_exceptions.ResourceExhausted):
                 raise RateLimitError(provider=provider, model=model, message=str(e))
-            if isinstance(e, google_exceptions.Unauthenticated):
+            if hasattr(google_exceptions, 'Unauthenticated') and isinstance(e, google_exceptions.Unauthenticated):
                 raise AuthenticationError(provider=provider, model=model, message=str(e))
-            if isinstance(e, google_exceptions.GoogleAPIError):
+            if hasattr(google_exceptions, 'GoogleAPIError') and isinstance(e, google_exceptions.GoogleAPIError):
                 raise ProviderUnavailableError(provider=provider, model=model, message=str(e))
 
         # Fallback for unknown exceptions

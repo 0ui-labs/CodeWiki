@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     max_tokens_per_module: int = 36_369
     max_tokens_per_leaf: int = 16_000
 
+    # Custom context limits for models not in the default map.
+    # Format: {"model-name": context_limit_in_tokens}
+    # Example: {"my-custom-model": 32000, "local/llama": 8192}
+    # These will be merged with MODEL_CONTEXT_LIMITS, with custom values taking precedence.
+    custom_context_limits: dict[str, int] = Field(default_factory=dict)
+
     # Output
     output_dir: str = "./docs"
     log_level: str = "INFO"

@@ -72,3 +72,31 @@ class AuthenticationError(LLMError):
     def __str__(self) -> str:
         """Return a string representation indicating authentication failure."""
         return f"Authentication Error [{self.provider}/{self.model}]: {self.message}"
+
+
+@dataclass
+class LLMTimeoutError(LLMError):
+    """Exception raised when API request times out.
+
+    Note: Named LLMTimeoutError to avoid shadowing Python's built-in TimeoutError.
+    """
+
+    timeout: float
+
+    def __str__(self) -> str:
+        """Return a string representation including timeout duration."""
+        return f"Timeout Error [{self.provider}/{self.model}]: {self.message} (timeout: {self.timeout}s)"
+
+
+@dataclass
+class InvalidModelError(LLMError):
+    """Exception raised when model name is invalid or not supported."""
+
+    suggestions: list[str] | None = None
+
+    def __str__(self) -> str:
+        """Return a string representation including suggestions if available."""
+        base = f"Invalid Model Error [{self.provider}/{self.model}]: {self.message}"
+        if self.suggestions:
+            base += f" (suggestions: {', '.join(self.suggestions)})"
+        return base

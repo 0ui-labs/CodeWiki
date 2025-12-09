@@ -43,7 +43,7 @@ from pydantic_ai.messages import (
 )
 
 from codewiki.core.config import Settings
-from codewiki.core.llm import ResilientLLMClient, LLMClient, RetryConfig
+from codewiki.core.llm import ResilientLLMClient, LLMClient, RetryConfig, ToolCall
 from codewiki.core.errors import LLMError
 
 if TYPE_CHECKING:
@@ -59,15 +59,14 @@ class CodeWikiModel(Model):
     - Tool call support for pydantic_ai Agents
     - Proper error handling and logging
 
-    Note: This implementation currently does NOT support tool calls from the LLM.
-    Tool calls require native provider SDK integration (Anthropic/OpenAI format)
-    which is not yet available in ResilientLLMClient. The LLMClient only returns
-    text content.
+    Tool calls are fully supported through the LLM client infrastructure:
+    - Anthropic models: Parse tool_use blocks from response.content
+    - OpenAI models: Parse tool_calls from message.tool_calls
+    - Groq/Cerebras: Use OpenAI-compatible format
+    - Google Gemini: Not yet implemented (would require custom parsing)
 
-    To add tool call support in the future:
-    1. Extend LLMClient._call_anthropic and _call_openai to parse tool_use blocks
-    2. Update LLMResponse to include optional tool_calls field
-    3. Update this adapter to convert tool calls to ToolCallPart objects
+    The adapter converts tool calls from LLMResponse to pydantic_ai ToolCallPart
+    objects, enabling full agent functionality with tools.
 
     Attributes:
         settings: Application settings with API keys and model config
@@ -156,7 +155,7 @@ class CodeWikiModel(Model):
         1. Converts pydantic_ai messages to core LLM format
         2. Calls ResilientLLMClient.complete() with retry/fallback support
         3. Converts LLM response to pydantic_ai ModelResponse format
-        4. Handles tool calls if present (currently NOT supported, see class docstring)
+        4. Handles tool calls if present in the response
 
         Args:
             messages: List of pydantic_ai ModelMessage objects
@@ -193,8 +192,27 @@ class CodeWikiModel(Model):
         )
 
         # Convert to pydantic_ai format
-        # Note: LLMResponse only contains text content, no tool calls yet
-        parts = [TextPart(content=llm_response.content)]
+        # Build response parts in the correct order: tool calls first, then text
+        parts = []
+
+        # Add tool calls first (if any)
+        if llm_response.tool_calls:
+            for tc in llm_response.tool_calls:
+                parts.append(
+                    ToolCallPart(
+                        tool_name=tc.tool_name,
+                        args=tc.args,
+                        tool_call_id=tc.tool_call_id,
+                    )
+                )
+
+        # Add text content (if any)
+        if llm_response.content:
+            parts.append(TextPart(content=llm_response.content))
+
+        # If no parts at all, add empty text
+        if not parts:
+            parts.append(TextPart(content=""))
 
         # Build usage stats
         usage = RequestUsage(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 try:
@@ -93,6 +93,21 @@ _MODEL_CONTEXT_LIMITS_LOWER: dict[str, str] = {
 
 
 @dataclass
+class ToolCall:
+    """Represents a tool/function call from the LLM.
+
+    Attributes:
+        tool_name: Name of the tool being called
+        args: Arguments to pass to the tool (as dict)
+        tool_call_id: Unique identifier for this tool call
+    """
+
+    tool_name: str
+    args: dict
+    tool_call_id: str
+
+
+@dataclass
 class LLMResponse:
     """Response from LLM provider with token usage statistics and cost.
 
@@ -103,6 +118,7 @@ class LLMResponse:
         model: Model identifier used for the request
         provider: Provider name (e.g., 'anthropic', 'openai')
         cost: Total cost in USD for this API call
+        tool_calls: List of tool calls requested by the LLM (if any)
     """
 
     content: str
@@ -111,6 +127,7 @@ class LLMResponse:
     model: str
     provider: str
     cost: float
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 class LLMClient:
@@ -428,17 +445,36 @@ class LLMClient:
                 **kwargs,
             )
 
+            # Parse response content - can contain both text and tool calls
+            content = ""
+            tool_calls = []
+
+            for block in response.content:
+                if hasattr(block, "text"):
+                    # Text content block
+                    content += block.text
+                elif hasattr(block, "type") and block.type == "tool_use":
+                    # Anthropic tool use block
+                    tool_calls.append(
+                        ToolCall(
+                            tool_name=block.name,
+                            args=block.input if isinstance(block.input, dict) else {},
+                            tool_call_id=block.id,
+                        )
+                    )
+
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
             cost = calculate_cost(model, input_tokens, output_tokens)
 
             return LLMResponse(
-                content=response.content[0].text,
+                content=content,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 model=model,
                 provider="anthropic",
                 cost=cost,
+                tool_calls=tool_calls,
             )
         except Exception as e:
             # Wrap exceptions in LLMError subclasses
@@ -472,17 +508,44 @@ class LLMClient:
                 **kwargs,
             )
 
+            # Parse response message - can contain both text and tool calls
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = []
+
+            if message.tool_calls:
+                import json
+
+                for tc in message.tool_calls:
+                    # Parse arguments (may be JSON string)
+                    args = {}
+                    if tc.function.arguments:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            # If parsing fails, store as empty dict
+                            args = {}
+
+                    tool_calls.append(
+                        ToolCall(
+                            tool_name=tc.function.name,
+                            args=args,
+                            tool_call_id=tc.id,
+                        )
+                    )
+
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
             cost = calculate_cost(model, input_tokens, output_tokens)
 
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 model=model,
                 provider="openai",
                 cost=cost,
+                tool_calls=tool_calls,
             )
         except Exception as e:
             self._handle_exception(e, "openai", model, timeout)
@@ -585,17 +648,43 @@ class LLMClient:
                 **kwargs,
             )
 
+            # Parse response message - can contain both text and tool calls
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = []
+
+            if message.tool_calls:
+                import json
+
+                for tc in message.tool_calls:
+                    # Parse arguments (may be JSON string)
+                    args = {}
+                    if tc.function.arguments:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+
+                    tool_calls.append(
+                        ToolCall(
+                            tool_name=tc.function.name,
+                            args=args,
+                            tool_call_id=tc.id,
+                        )
+                    )
+
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
             cost = calculate_cost(model, input_tokens, output_tokens)
 
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 model=model,
                 provider="groq",
                 cost=cost,
+                tool_calls=tool_calls,
             )
         except Exception as e:
             self._handle_exception(e, "groq", model, timeout)
@@ -634,17 +723,43 @@ class LLMClient:
                 **kwargs,
             )
 
+            # Parse response message - can contain both text and tool calls
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = []
+
+            if message.tool_calls:
+                import json
+
+                for tc in message.tool_calls:
+                    # Parse arguments (may be JSON string)
+                    args = {}
+                    if tc.function.arguments:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+
+                    tool_calls.append(
+                        ToolCall(
+                            tool_name=tc.function.name,
+                            args=args,
+                            tool_call_id=tc.id,
+                        )
+                    )
+
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
             cost = calculate_cost(model, input_tokens, output_tokens)
 
             return LLMResponse(
-                content=response.choices[0].message.content,
+                content=content,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 model=model,
                 provider="cerebras",
                 cost=cost,
+                tool_calls=tool_calls,
             )
         except Exception as e:
             self._handle_exception(e, "cerebras", model, timeout)

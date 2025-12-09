@@ -2,7 +2,8 @@ import re
 from pathlib import Path
 from typing import List, Tuple
 import logging
-import tiktoken
+
+from codewiki.core.llm.tokenizers import TokenCounter
 
 
 logger = logging.getLogger(__name__)
@@ -26,15 +27,19 @@ def is_complex_module(components: dict[str, any], core_component_ids: list[str])
 # ---------------------- Token Counting ---------------------
 # ------------------------------------------------------------
 
-enc = tiktoken.encoding_for_model("gpt-4")
+_token_counter = TokenCounter()
 
-def count_tokens(text: str) -> int:
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """Count tokens using TokenCounter (backward compatible).
+
+    Args:
+        text: Text to count tokens for
+        model: Model name for tokenizer selection (default: gpt-4)
+
+    Returns:
+        Number of tokens
     """
-    Count the number of tokens in a text.
-    """
-    length = len(enc.encode(text))
-    # logger.debug(f"Number of tokens: {length}")
-    return length
+    return _token_counter.count(text, model)
 
 
 # ------------------------------------------------------------

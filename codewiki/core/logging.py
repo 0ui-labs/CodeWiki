@@ -85,11 +85,55 @@ class StructuredFileHandler(RotatingFileHandler):
     - UTC timestamps for consistency across timezones
     - Secret sanitization for API keys, tokens, etc.
 
+    JSON Structure:
+        Core structural fields (always at top level, controlled by handler):
+        - timestamp: ISO 8601 UTC timestamp
+        - level: Log level name (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        - message: Log message text
+        - module: Source module name (if available)
+        - logger: Logger name (if available)
+
+        User metadata fields are merged at top level if they don't conflict
+        with reserved keys. Any conflicting keys are namespaced under "data".
+
     Args:
         filepath: Path to the log file
         max_bytes: Maximum file size before rotation (default: 10MB)
         backup_count: Number of backup files to keep (default: 3)
     """
+
+    # Reserved keys that the handler controls - user extra data cannot override these
+    # Includes core structural fields and common LogRecord attributes
+    _RESERVED_KEYS: frozenset[str] = frozenset({
+        # Core structural fields
+        "timestamp",
+        "level",
+        "message",
+        "module",
+        "logger",
+        # LogRecord standard attributes that could leak through
+        "name",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "process",
+        "processName",
+        "args",
+        "msg",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        # Our custom attribute
+        "extra",
+    })
 
     def __init__(
         self,
@@ -113,13 +157,18 @@ class StructuredFileHandler(RotatingFileHandler):
 
         Overrides the parent's format method to produce JSON output.
 
+        User-provided extra fields are merged at the top level if they don't
+        conflict with reserved structural keys. Any conflicting keys are
+        collected into a "data" sub-dictionary to preserve the information
+        while maintaining structural integrity.
+
         Args:
             record: The log record to format
 
         Returns:
             JSON string representation of the log entry
         """
-        # Build the log entry
+        # Build the log entry with core structural fields
         log_entry: dict[str, Any] = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "level": record.levelname,
@@ -130,17 +179,40 @@ class StructuredFileHandler(RotatingFileHandler):
         if record.module:
             log_entry["module"] = record.module
 
+        # Add logger name if meaningful (not empty)
+        if record.name and record.name != "root":
+            log_entry["logger"] = record.name
+
         # Merge extra fields (if present)
         extra = getattr(record, "extra", {})
         if extra:
-            # Sanitize extra data before adding
+            # Sanitize extra data before processing
             sanitized_extra = _sanitize(extra)
-            # Extra fields should not override core fields
+
+            # Separate conflicting keys from safe keys
+            conflicting: dict[str, Any] = {}
             for key, value in sanitized_extra.items():
-                if key not in ("timestamp", "level", "message"):
+                if key in self._RESERVED_KEYS:
+                    # Collect conflicting keys for namespacing
+                    conflicting[key] = value
+                else:
+                    # Safe to merge at top level
                     log_entry[key] = value
 
-        # Sanitize the entire entry
+            # Namespace conflicting keys under "data" to preserve them
+            if conflicting:
+                if "data" in log_entry:
+                    existing_data = log_entry["data"]
+                    if isinstance(existing_data, dict):
+                        # Merge conflicting keys into existing dict
+                        existing_data.update(conflicting)
+                    else:
+                        # Preserve non-dict value under "_original" key
+                        log_entry["data"] = {"_original": existing_data, **conflicting}
+                else:
+                    log_entry["data"] = conflicting
+
+        # Sanitize the entire entry (catches any remaining sensitive data)
         log_entry = _sanitize(log_entry)
 
         return json.dumps(log_entry)
@@ -175,14 +247,31 @@ class CodeWikiLogger:
 
     Provides semantic log methods with colored icons for console output:
     - info(): Blue ℹ icon
-    - success(): Green ✓ icon
+    - success(): Green ✓ icon (INFO level)
     - warning(): Yellow ⚠ icon
     - error(): Red ✗ icon
     - debug(): Dim 🔍 icon (only shown at DEBUG level)
 
+    Log Level Behavior:
+        Both console and file outputs share a single log level threshold from
+        ``settings.log_level``. Messages below this threshold are suppressed
+        for both sinks. This simplified model ensures consistent behavior
+        across outputs.
+
+        For example, with ``log_level="WARNING"``:
+        - debug(), info(), success() messages are suppressed everywhere
+        - warning(), error() messages appear in both console and file
+
+        If separate thresholds per sink are needed in the future, the Settings
+        class can be extended with ``console_log_level`` and ``file_log_level``.
+
     Args:
-        settings: Settings object with log_level and log_file attributes.
-                  Uses duck typing - any object with these attributes works.
+        settings: Settings object with the following attributes:
+            - log_level (str): Minimum log level threshold for both console and
+              file output. One of: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL".
+              Defaults to "INFO" if not specified or invalid.
+            - log_file (str | None): Path to JSON log file. If None or not set,
+              file logging is disabled and only console output is produced.
 
     Example:
         from codewiki.core import Settings, get_logger
@@ -224,7 +313,17 @@ class CodeWikiLogger:
             self.file_handler = None
 
     def _should_log(self, level: int) -> bool:
-        """Check if a message at the given level should be logged."""
+        """Check if a message at the given level should be logged.
+
+        Uses a single threshold for both console and file output.
+        See class docstring for details on log level behavior.
+
+        Args:
+            level: Python logging level (e.g., logging.INFO, logging.DEBUG)
+
+        Returns:
+            True if the message should be logged to both console and file
+        """
         return level >= self._level
 
     def _log_to_file(self, level: int, msg: str, extra: dict[str, Any]) -> None:

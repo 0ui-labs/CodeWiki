@@ -63,11 +63,15 @@ class RetryConfig:
 
     Attributes:
         max_retries: Maximum retry attempts per model before trying fallback.
-            Default is 3, meaning up to 3 attempts per model.
+            Default is 3, meaning up to 3 attempts per model. Must be at least 1.
+            Values less than 1 will raise ValueError.
         base_delay: Base delay in seconds for exponential backoff.
             Actual delay is base_delay * 2^attempt + jitter.
         fallback_models: Ordered list of fallback model names to try if
             the primary model fails. Empty list means no fallbacks.
+
+    Raises:
+        ValueError: If max_retries is less than 1.
 
     Example:
         >>> config = RetryConfig(
@@ -80,6 +84,14 @@ class RetryConfig:
     max_retries: int = 3
     base_delay: float = 1.0
     fallback_models: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validate configuration after initialization."""
+        if self.max_retries < 1:
+            raise ValueError(
+                f"max_retries must be at least 1, got {self.max_retries}. "
+                "At least one attempt is required to make any API call."
+            )
 
 
 class ResilientLLMClient:
@@ -226,6 +238,24 @@ class ResilientLLMClient:
 
                     self.logger.warning(
                         f"Error from {current_model} "
+                        f"(attempt {attempt + 1}/{self.config.max_retries}): {e}, "
+                        f"waiting {delay:.2f}s"
+                    )
+
+                    await asyncio.sleep(delay)
+                    # Continue to next attempt
+
+                except Exception as e:
+                    # Re-raise CancelledError immediately - it's not a retriable error
+                    if isinstance(e, asyncio.CancelledError):
+                        raise
+
+                    # Retry other unexpected exceptions with backoff
+                    last_error = e
+                    delay = self._calculate_backoff(attempt)
+
+                    self.logger.warning(
+                        f"Unexpected error from {current_model} "
                         f"(attempt {attempt + 1}/{self.config.max_retries}): {e}, "
                         f"waiting {delay:.2f}s"
                     )

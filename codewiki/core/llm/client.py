@@ -1,8 +1,9 @@
 """LLM client implementation with multi-provider support."""
 
-import logging
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 try:
     import httpx
@@ -50,6 +51,9 @@ from codewiki.core.errors import (
     LLMTimeoutError,
     InvalidModelError,
 )
+
+if TYPE_CHECKING:
+    from codewiki.core.logging import CodeWikiLogger
 
 # Common model name aliases mapped to their correct identifiers.
 # Used by validate_model() to auto-correct user-provided model names.
@@ -112,16 +116,25 @@ class LLMResponse:
 class LLMClient:
     """Multi-provider LLM client with unified interface."""
 
-    def __init__(self, settings: Settings, token_counter: Optional[TokenCounter] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        token_counter: Optional[TokenCounter] = None,
+        logger: Optional[CodeWikiLogger] = None,
+    ):
         """
         Initialize LLMClient with settings and optional token counter.
 
         Args:
             settings: Application settings with API keys and model config
             token_counter: Optional TokenCounter instance (creates new if None)
+            logger: Optional CodeWikiLogger for structured logging.
+                    If provided, logs model corrections and validation warnings.
+                    If None, no logging is performed.
         """
         self.settings = settings
         self.token_counter = token_counter if token_counter is not None else TokenCounter(settings)
+        self._logger = logger
 
         # Lazy-loaded provider clients
         self._anthropic: Optional[AsyncAnthropic] = None
@@ -310,15 +323,24 @@ class LLMClient:
         # Check if it's a known alias (case-insensitive)
         if model_lower in MODEL_ALIASES:
             corrected = MODEL_ALIASES[model_lower]
-            logging.info(f"Auto-correcting model alias '{model}' to '{corrected}'")
+            if self._logger:
+                self._logger.info(
+                    f"Auto-correcting model alias '{model}' to '{corrected}'",
+                    original_model=model,
+                    corrected_model=corrected,
+                )
             return corrected
 
         # Check if it's a known model (case-insensitive)
         # This handles inputs like "GPT-4O" -> "gpt-4o"
         if model_lower in _MODEL_CONTEXT_LIMITS_LOWER:
             canonical = _MODEL_CONTEXT_LIMITS_LOWER[model_lower]
-            if canonical != model:
-                logging.debug(f"Normalized model case '{model}' to '{canonical}'")
+            if canonical != model and self._logger:
+                self._logger.debug(
+                    f"Normalized model case '{model}' to '{canonical}'",
+                    original_model=model,
+                    canonical_model=canonical,
+                )
             return canonical
 
         # Unknown model
@@ -334,10 +356,12 @@ class LLMClient:
             )
         else:
             # In non-strict mode, warn and allow
-            logging.warning(
-                f"Model '{model}' is not in the known models list. "
-                f"This may be a custom model or could cause API errors if invalid."
-            )
+            if self._logger:
+                self._logger.warning(
+                    f"Model '{model}' is not in the known models list. "
+                    f"This may be a custom model or could cause API errors if invalid.",
+                    model=model,
+                )
             return model
 
     def _get_model_suggestions(self, invalid_model: str, provider: str) -> list[str] | None:

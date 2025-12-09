@@ -5,6 +5,8 @@ import sys
 from dotenv import load_dotenv
 load_dotenv()
 
+from codewiki.core import Settings as CoreSettings
+
 # Constants
 OUTPUT_BASE_DIR = 'output'
 DEPENDENCY_GRAPHS_DIR = 'dependency_graphs'
@@ -84,7 +86,7 @@ class Config:
     ) -> 'Config':
         """
         Create configuration for CLI context.
-        
+
         Args:
             repo_path: Repository path
             output_dir: Output directory for generated docs
@@ -93,13 +95,13 @@ class Config:
             main_model: Primary model
             cluster_model: Clustering model
             fallback_model: Fallback model
-            
+
         Returns:
             Config instance
         """
         repo_name = os.path.basename(os.path.normpath(repo_path))
         base_output_dir = os.path.join(output_dir, "temp")
-        
+
         return cls(
             repo_path=repo_path,
             output_dir=base_output_dir,
@@ -111,4 +113,42 @@ class Config:
             main_model=main_model,
             cluster_model=cluster_model,
             fallback_model=fallback_model
+        )
+
+    def to_core_settings(self) -> CoreSettings:
+        """Convert old Config to new core.Settings."""
+        return CoreSettings(
+            main_model=self.main_model,
+            fallback_models=[self.fallback_model],
+            cluster_model=self.cluster_model,
+            # Map API keys from environment
+            anthropic_api_key=os.getenv('ANTHROPIC_API_KEY'),
+            openai_api_key=os.getenv('OPENAI_API_KEY'),
+            google_api_key=os.getenv('GOOGLE_API_KEY'),
+            groq_api_key=os.getenv('GROQ_API_KEY'),
+            cerebras_api_key=os.getenv('CEREBRAS_API_KEY'),
+            # Output settings
+            output_dir=self.docs_dir,
+            log_level=os.getenv('LOG_LEVEL', 'INFO'),
+            max_tokens_per_module=MAX_TOKEN_PER_MODULE,
+            max_tokens_per_leaf=MAX_TOKEN_PER_LEAF_MODULE,
+        )
+
+    @classmethod
+    def from_core_settings(cls, settings: CoreSettings, repo_path: str) -> 'Config':
+        """Create old Config from core.Settings (for backward compatibility)."""
+        repo_name = os.path.basename(os.path.normpath(repo_path))
+        base_output_dir = os.path.join(settings.output_dir, "temp")
+
+        return cls(
+            repo_path=repo_path,
+            output_dir=base_output_dir,
+            dependency_graph_dir=os.path.join(base_output_dir, DEPENDENCY_GRAPHS_DIR),
+            docs_dir=settings.output_dir,
+            max_depth=MAX_DEPTH,
+            llm_base_url=os.getenv('LLM_BASE_URL', 'http://0.0.0.0:4000/'),
+            llm_api_key=os.getenv('LLM_API_KEY', 'sk-1234'),
+            main_model=settings.main_model,
+            cluster_model=settings.cluster_model or settings.main_model,
+            fallback_model=settings.fallback_models[0] if settings.fallback_models else 'gpt-4o'
         )

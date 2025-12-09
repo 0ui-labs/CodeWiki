@@ -207,7 +207,10 @@ class CLIDocumentationGenerator:
             if os.path.exists(first_module_tree_path):
                 module_tree = file_manager.load_json(first_module_tree_path)
             else:
-                module_tree = cluster_modules(leaf_nodes, components, backend_config)
+                module_tree = await cluster_modules(
+                    leaf_nodes, components, doc_generator.settings,
+                    doc_generator.resilient_client, doc_generator.logger
+                )
                 file_manager.save_json(module_tree, first_module_tree_path)
             
             file_manager.save_json(module_tree, module_tree_path)

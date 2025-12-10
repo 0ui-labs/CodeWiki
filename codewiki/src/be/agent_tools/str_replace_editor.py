@@ -4,6 +4,7 @@
 This tool is used to view the given source code and view/edit the documentation files in the separate docs directory.
 """
 
+import asyncio
 import json
 import re
 import subprocess
@@ -23,6 +24,7 @@ from pydantic_ai import RunContext, Tool
 
 from .deps import CodeWikiDeps
 from ..utils import validate_mermaid_diagrams
+from codewiki.core.logging import get_logger
 
 
 # There are some super strange "ascii can't decode x" errors,
@@ -379,7 +381,7 @@ class EditTool:
     def _file_history(self, value: dict):
         self.REGISTRY["file_history"] = json.dumps(value)
 
-    def __call__(
+    async def __call__(
         self,
         *,
         command: Command,
@@ -395,18 +397,18 @@ class EditTool:
         if not self.validate_path(command, _path):
             return
         if command == "view":
-            return self.view(_path, view_range)
+            return await self.view(_path, view_range)
         elif command == "create":
             if file_text is None:
                 self.logs.append("Parameter `file_text` is required for command: create")
                 return
-            self.create_file(_path, file_text)
+            await self.create_file(_path, file_text)
             return None
         elif command == "str_replace":
             if old_str is None:
                 self.logs.append("Parameter `old_str` is required for command: str_replace")
                 return
-            return self.str_replace(_path, old_str, new_str)
+            return await self.str_replace(_path, old_str, new_str)
         elif command == "insert":
             if insert_line is None:
                 self.logs.append("Parameter `insert_line` is required for command: insert")
@@ -414,9 +416,9 @@ class EditTool:
             if new_str is None:
                 self.logs.append("Parameter `new_str` is required for command: insert")
                 return
-            return self.insert(_path, insert_line, new_str)
+            return await self.insert(_path, insert_line, new_str)
         elif command == "undo_edit":
-            return self.undo_edit(_path)
+            return await self.undo_edit(_path)
         self.logs.append(
             f'Unrecognized command {command}. The allowed commands for the {self.name} tool are: "view", "create", "str_replace", "insert", "undo_edit"'
         )
@@ -447,22 +449,27 @@ class EditTool:
                 return False
         return True
 
-    def create_file(self, path: Path, file_text: str):
+    async def create_file(self, path: Path, file_text: str):
         if not path.parent.exists():
             self.logs.append(f"The parent directory {self._get_display_path(path.parent)} does not exist. Please create it first.")
             return
-        self.write_file(path, file_text)
+        await self.write_file(path, file_text)
         self._file_history[path].append(file_text)
         self.logs.append(f"File created successfully at: {self._get_display_path(path)}")
 
-    def view(self, path: Path, view_range: Optional[List[int]] = None):
-        """Implement the view command"""
+    async def view(self, path: Path, view_range: Optional[List[int]] = None):
+        """Implement the view command.
+
+        Uses asyncio.to_thread for non-blocking subprocess execution.
+        """
         if path.is_dir():
             if view_range:
                 self.logs.append("The `view_range` parameter is not allowed when `path` points to a directory.")
                 return
 
-            out = subprocess.run(
+            # Non-blocking subprocess execution
+            out = await asyncio.to_thread(
+                subprocess.run,
                 rf"find {path} -maxdepth 2 -not -path '*/\.*'",
                 shell=True,
                 stdout=subprocess.PIPE,
@@ -477,7 +484,7 @@ class EditTool:
                 self.logs.append(stdout)
             return
 
-        file_content = self.read_file(path)
+        file_content = await self.read_file(path)
         if view_range:
             if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
                 self.logs.append("Invalid `view_range`. It should be a list of two integers.")
@@ -534,10 +541,13 @@ class EditTool:
         # init_line is 1-based
         self.logs.append(self._make_output(file_content, self._get_display_path(path), init_line=init_line))
 
-    def str_replace(self, path: Path, old_str: str, new_str: Optional[str]):
-        """Implement the str_replace command, which replaces old_str with new_str in the file content"""
+    async def str_replace(self, path: Path, old_str: str, new_str: Optional[str]):
+        """Implement the str_replace command, which replaces old_str with new_str in the file content.
+
+        Uses async file IO for non-blocking operations.
+        """
         # Read the file content
-        file_content = self.read_file(path).expandtabs()
+        file_content = (await self.read_file(path)).expandtabs()
         old_str = old_str.expandtabs()
         new_str = new_str.expandtabs() if new_str is not None else ""
 
@@ -569,7 +579,7 @@ class EditTool:
         new_file_content = file_content.replace(old_str, new_str)
 
         # Write the new content to the file
-        self.write_file(path, new_file_content)
+        await self.write_file(path, new_file_content)
 
         post_edit_lint = ""
         if USE_LINTER:
@@ -614,9 +624,12 @@ class EditTool:
 
         self.logs.append(success_msg)
 
-    def insert(self, path: Path, insert_line: int, new_str: str):
-        """Implement the insert command, which inserts new_str at the specified line in the file content."""
-        file_text = self.read_file(path).expandtabs()
+    async def insert(self, path: Path, insert_line: int, new_str: str):
+        """Implement the insert command, which inserts new_str at the specified line in the file content.
+
+        Uses async file IO for non-blocking operations.
+        """
+        file_text = (await self.read_file(path)).expandtabs()
         new_str = new_str.expandtabs()
         file_text_lines = file_text.split("\n")
         n_lines_file = len(file_text_lines)
@@ -638,7 +651,7 @@ class EditTool:
         new_file_text = "\n".join(new_file_text_lines)
         snippet = "\n".join(snippet_lines)
 
-        self.write_file(path, new_file_text)
+        await self.write_file(path, new_file_text)
         self._file_history[path].append(file_text)
 
         # todo: Also expand these windows
@@ -652,19 +665,25 @@ class EditTool:
         success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
         self.logs.append(success_msg)
 
-    def undo_edit(self, path: Path):
-        """Implement the undo_edit command."""
+    async def undo_edit(self, path: Path):
+        """Implement the undo_edit command.
+
+        Uses async file IO for non-blocking operations.
+        """
         if not self._file_history[path]:
             self.logs.append(f"No edit history found for {self._get_display_path(path)}.")
             return
 
         old_text = self._file_history[path].pop()
-        self.write_file(path, old_text)
+        await self.write_file(path, old_text)
 
         self.logs.append(f"Last edit to {self._get_display_path(path)} undone successfully. {self._make_output(old_text, self._get_display_path(path))}")
 
-    def read_file(self, path: Path):
-        """Read the content of a file from a given path; raise a ToolError if an error occurs."""
+    async def read_file(self, path: Path):
+        """Read the content of a file from a given path; raise a ToolError if an error occurs.
+
+        Uses asyncio.to_thread for non-blocking file IO.
+        """
         encodings = [
             (None, None),
             ("utf-8", None),
@@ -674,7 +693,8 @@ class EditTool:
         exception = None
         for self._encoding, errors in encodings:
             try:
-                text = path.read_text(encoding=self._encoding, errors=errors)
+                # Non-blocking file read
+                text = await asyncio.to_thread(path.read_text, encoding=self._encoding, errors=errors)
             except UnicodeDecodeError as e:
                 exception = e
             else:
@@ -684,10 +704,14 @@ class EditTool:
             return
         return text
 
-    def write_file(self, path: Path, file: str):
-        """Write the content of a file to a given path; raise a ToolError if an error occurs."""
+    async def write_file(self, path: Path, file: str):
+        """Write the content of a file to a given path; raise a ToolError if an error occurs.
+
+        Uses asyncio.to_thread for non-blocking file IO.
+        """
         try:
-            path.write_text(file, encoding=self._encoding or "utf-8")
+            # Non-blocking file write
+            await asyncio.to_thread(path.write_text, file, encoding=self._encoding or "utf-8")
         except Exception as e:
             self.logs.append(f"Ran into {e} while trying to write to {self._get_display_path(path)}")
             return
@@ -746,8 +770,9 @@ async def str_replace_editor(
     # validate command
     if command != "view" and working_dir == "repo":
         return "The `view` command is the only allowed command when `working_dir` is `repo`."
-    
-    tool(
+
+    # Async call to EditTool for non-blocking file IO
+    await tool(
         command=command,
         path=absolute_path,
         file_text=file_text,
@@ -760,7 +785,8 @@ async def str_replace_editor(
     result = "\n".join(tool.logs)
 
     if command != "view" and path.endswith(".md"):
-        mermaid_validation = await validate_mermaid_diagrams(absolute_path, path)
+        mermaid_logger = get_logger(ctx.deps.settings)
+        mermaid_validation = await validate_mermaid_diagrams(absolute_path, path, mermaid_logger)
         result = result + "\n---------- Mermaid validation ----------\n" + mermaid_validation
 
     return result

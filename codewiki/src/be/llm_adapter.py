@@ -153,9 +153,10 @@ class CodeWikiModel(Model):
 
         This method:
         1. Converts pydantic_ai messages to core LLM format
-        2. Calls ResilientLLMClient.complete() with retry/fallback support
-        3. Converts LLM response to pydantic_ai ModelResponse format
-        4. Handles tool calls if present in the response
+        2. Extracts tool definitions from model_request_parameters
+        3. Calls ResilientLLMClient.complete() with retry/fallback support
+        4. Converts LLM response to pydantic_ai ModelResponse format
+        5. Handles tool calls if present in the response
 
         Args:
             messages: List of pydantic_ai ModelMessage objects
@@ -183,12 +184,21 @@ class CodeWikiModel(Model):
                 temperature = getattr(model_settings, "temperature", 0.0) or 0.0
                 max_tokens = getattr(model_settings, "max_tokens", 4096) or 4096
 
+        # Extract and convert tool definitions from model_request_parameters
+        tools = self._convert_tools_for_provider(model_request_parameters)
+
+        # Build kwargs for the LLM call
+        call_kwargs: dict[str, Any] = {}
+        if tools:
+            call_kwargs["tools"] = tools
+
         # Call LLM with retry/fallback support
         llm_response = await self.client.complete(
             messages=core_messages,
             model=self.codewiki_settings.main_model,
             temperature=temperature,
             max_tokens=max_tokens,
+            **call_kwargs,
         )
 
         # Convert to pydantic_ai format
@@ -311,3 +321,63 @@ class CodeWikiModel(Model):
                 text_parts.append(str(part))
 
         return "\n".join(text_parts)
+
+    def _convert_tools_for_provider(
+        self, model_request_parameters: ModelRequestParameters
+    ) -> list[dict[str, Any]] | None:
+        """Convert pydantic_ai tool definitions to provider-specific format.
+
+        Extracts function_tools from model_request_parameters and converts them
+        to a format compatible with OpenAI/Anthropic tool calling APIs.
+
+        The format is based on OpenAI's tool format which is also supported by:
+        - Anthropic (via 'tools' parameter with slightly different structure)
+        - Groq (OpenAI-compatible)
+        - Cerebras (OpenAI-compatible)
+
+        Note: Google Gemini uses a different format and is not yet supported.
+
+        Args:
+            model_request_parameters: Contains function_tools list of ToolDefinition
+
+        Returns:
+            List of tool definitions in OpenAI format, or None if no tools defined
+        """
+        # Get function_tools from model_request_parameters
+        function_tools = getattr(model_request_parameters, "function_tools", [])
+        if not function_tools:
+            return None
+
+        # Detect provider to choose the right format
+        model_lower = self.codewiki_settings.main_model.lower()
+        provider = self.system  # Uses the same detection logic
+
+        tools = []
+        for tool_def in function_tools:
+            # Extract tool definition attributes
+            tool_name = getattr(tool_def, "name", None)
+            tool_description = getattr(tool_def, "description", "") or ""
+            tool_schema = getattr(tool_def, "parameters_json_schema", {}) or {}
+
+            if not tool_name:
+                continue
+
+            if provider == "anthropic":
+                # Anthropic format: name, description, input_schema at top level
+                tools.append({
+                    "name": tool_name,
+                    "description": tool_description,
+                    "input_schema": tool_schema,
+                })
+            else:
+                # OpenAI format (also used by Groq, Cerebras)
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": tool_schema,
+                    },
+                })
+
+        return tools if tools else None

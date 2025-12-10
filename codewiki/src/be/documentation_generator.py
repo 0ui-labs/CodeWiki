@@ -1,8 +1,36 @@
 import os
 import json
+from dataclasses import dataclass, field
 from typing import Dict, List, Any
 from copy import deepcopy
 import traceback
+
+
+@dataclass
+class GenerationResult:
+    """Result of documentation generation with success/partial status tracking."""
+
+    success: bool = True
+    partial_success: bool = False
+    output_dir: str = ""
+    failed_leaf_modules: List[str] = field(default_factory=list)
+    failed_parent_modules: List[str] = field(default_factory=list)
+    error_messages: List[str] = field(default_factory=list)
+
+    @property
+    def has_failures(self) -> bool:
+        """Check if any modules failed during generation."""
+        return len(self.failed_leaf_modules) > 0 or len(self.failed_parent_modules) > 0
+
+    @property
+    def status_message(self) -> str:
+        """Get a human-readable status message."""
+        if not self.success:
+            return "Documentation generation failed"
+        if self.partial_success:
+            failed_count = len(self.failed_leaf_modules) + len(self.failed_parent_modules)
+            return f"Documentation generation completed with {failed_count} module failure(s)"
+        return "Documentation generation completed successfully"
 
 # Local imports
 from codewiki.src.be.dependency_analyzer import DependencyGraphBuilder
@@ -11,30 +39,48 @@ from codewiki.src.be.prompt_template import (
     MODULE_OVERVIEW_PROMPT,
 )
 from codewiki.src.be.cluster_modules import cluster_modules
-from codewiki.src.config import (
-    Config,
-    FIRST_MODULE_TREE_FILENAME,
-    MODULE_TREE_FILENAME,
-    OVERVIEW_FILENAME
-)
 from codewiki.src.utils import file_manager
 from codewiki.src.be.agent_orchestrator import AgentOrchestrator
 
 # Core imports
-from codewiki.core import Settings, ParallelModuleProcessor
+from codewiki.core import (
+    Settings,
+    ParallelModuleProcessor,
+    FIRST_MODULE_TREE_FILENAME,
+    MODULE_TREE_FILENAME,
+    OVERVIEW_FILENAME,
+)
 from codewiki.core.llm import ResilientLLMClient, LLMClient, RetryConfig
 from codewiki.core.logging import CodeWikiLogger, get_logger
 
 
 class DocumentationGenerator:
     """Main documentation generation orchestrator."""
-    
-    def __init__(self, config: Config, commit_id: str = None):
-        self.config = config
+
+    def __init__(
+        self,
+        settings: Settings,
+        repo_path: str,
+        output_dir: str,
+        dependency_graph_dir: str,
+        commit_id: str = None
+    ):
+        """
+        Initialize documentation generator.
+
+        Args:
+            settings: Core settings with LLM config
+            repo_path: Path to repository
+            output_dir: Directory for generated docs
+            dependency_graph_dir: Directory for dependency graphs
+            commit_id: Optional commit ID for metadata
+        """
+        self.settings = settings
+        self.repo_path = repo_path
+        self.output_dir = output_dir
+        self.dependency_graph_dir = dependency_graph_dir
         self.commit_id = commit_id
 
-        # Convert old Config to new Settings
-        self.settings = config.to_core_settings()
         self.logger = get_logger(self.settings)
 
         # Initialize LLM clients
@@ -52,30 +98,33 @@ class DocumentationGenerator:
             logger=self.logger
         )
 
-        # Keep existing components
-        self.graph_builder = DependencyGraphBuilder(config)
+        # Initialize components with explicit parameters
+        self.graph_builder = DependencyGraphBuilder(
+            repo_path=repo_path,
+            dependency_graph_dir=dependency_graph_dir
+        )
         self.agent_orchestrator = AgentOrchestrator(
             settings=self.settings,
-            repo_path=config.repo_path,
-            max_depth=config.max_depth
+            repo_path=repo_path,
+            max_depth=self.settings.max_depth
         )
     
     def create_documentation_metadata(self, working_dir: str, components: Dict[str, Any], num_leaf_nodes: int):
         """Create a metadata file with documentation generation information."""
         from datetime import datetime
-        
+
         metadata = {
             "generation_info": {
                 "timestamp": datetime.now().isoformat(),
-                "main_model": self.config.main_model,
+                "main_model": self.settings.main_model,
                 "generator_version": "1.0.0",
-                "repo_path": self.config.repo_path,
+                "repo_path": self.repo_path,
                 "commit_id": self.commit_id
             },
             "statistics": {
                 "total_components": len(components),
                 "leaf_nodes": num_leaf_nodes,
-                "max_depth": self.config.max_depth
+                "max_depth": self.settings.max_depth
             },
             "files_generated": [
                 "overview.md",
@@ -208,13 +257,13 @@ class DocumentationGenerator:
 
         return processed_module_tree
 
-    def _collect_modules_for_processing(
+    def _collect_leaf_modules_for_processing(
         self,
         module_tree: Dict[str, Any],
         components: Dict[str, Any],
         working_dir: str,
     ) -> List[Dict[str, Any]]:
-        """Collect all modules into a flat list with metadata for parallel processing.
+        """Collect only leaf modules into a flat list for parallel processing.
 
         Args:
             module_tree: The hierarchical module tree
@@ -222,7 +271,7 @@ class DocumentationGenerator:
             working_dir: Output directory for documentation
 
         Returns:
-            List of module dicts with 'name', 'path', 'is_leaf', 'components', 'working_dir'
+            List of leaf module dicts with 'name', 'path', 'components', 'working_dir'
         """
         modules: List[Dict[str, Any]] = []
 
@@ -233,15 +282,16 @@ class DocumentationGenerator:
 
                 is_leaf = self.is_leaf_module(module_info)
 
-                modules.append({
-                    "name": module_key,  # Used as key by ParallelModuleProcessor
-                    "module_name": module_name,
-                    "path": current_path,
-                    "is_leaf": is_leaf,
-                    "components": module_info.get("components", []),
-                    "working_dir": working_dir,
-                    "all_components": components,
-                })
+                # Only collect leaf modules for parallel processing
+                if is_leaf:
+                    modules.append({
+                        "name": module_key,  # Used as key by ParallelModuleProcessor
+                        "module_name": module_name,
+                        "path": current_path,
+                        "components": module_info.get("components", []),
+                        "working_dir": working_dir,
+                        "all_components": components,
+                    })
 
                 # Recursively process children
                 children = module_info.get("children", {})
@@ -251,72 +301,148 @@ class DocumentationGenerator:
         traverse(module_tree, [])
         return modules
 
-    async def generate_module_documentation(self, components: Dict[str, Any], leaf_nodes: List[str]) -> str:
+    def _collect_parent_modules(
+        self,
+        module_tree: Dict[str, Any],
+    ) -> List[List[str]]:
+        """Collect parent module paths in bottom-up order (deepest parents first).
+
+        Args:
+            module_tree: The hierarchical module tree
+
+        Returns:
+            List of module paths (each path is a list of module names), ordered
+            so that deeper parent modules come before shallower ones.
+        """
+        parent_paths: List[List[str]] = []
+
+        def traverse(node: Dict[str, Any], path: List[str]) -> None:
+            for module_name, module_info in node.items():
+                current_path = path + [module_name]
+
+                children = module_info.get("children", {})
+                if children and isinstance(children, dict) and len(children) > 0:
+                    # Recursively process children first (depth-first)
+                    traverse(children, current_path)
+                    # Add this parent module after its children
+                    parent_paths.append(current_path)
+
+        traverse(module_tree, [])
+        return parent_paths
+
+    async def generate_module_documentation(self, components: Dict[str, Any], leaf_nodes: List[str]) -> GenerationResult:
         """Generate documentation for all modules using parallel processing.
 
-        Uses ParallelModuleProcessor to process independent modules concurrently
-        while respecting dependencies (parents wait for children).
+        Uses ParallelModuleProcessor to process leaf modules concurrently,
+        then processes parent modules sequentially in bottom-up order.
+
+        Returns:
+            GenerationResult with success/partial status and failure details.
         """
+        # Initialize result tracking
+        result = GenerationResult(output_dir=os.path.abspath(self.output_dir))
+
         # Prepare output directory
-        working_dir = os.path.abspath(self.config.docs_dir)
+        working_dir = result.output_dir
         file_manager.ensure_directory(working_dir)
 
         module_tree_path = os.path.join(working_dir, MODULE_TREE_FILENAME)
         first_module_tree_path = os.path.join(working_dir, FIRST_MODULE_TREE_FILENAME)
         module_tree = file_manager.load_json(module_tree_path)
+
+        # Ensure module_tree and first_module_tree are consistent
+        # Both leaf and parent module collection must use the same tree source
         first_module_tree = file_manager.load_json(first_module_tree_path)
+        if module_tree != first_module_tree:
+            # Compute summary of differences for debugging
+            tree_keys = set(m.get("name", str(i)) for i, m in enumerate(module_tree)) if isinstance(module_tree, list) else set(module_tree.keys()) if isinstance(module_tree, dict) else set()
+            first_keys = set(m.get("name", str(i)) for i, m in enumerate(first_module_tree)) if isinstance(first_module_tree, list) else set(first_module_tree.keys()) if isinstance(first_module_tree, dict) else set()
+            only_in_current = tree_keys - first_keys
+            only_in_first = first_keys - tree_keys
+            raise RuntimeError(
+                f"Module tree inconsistency detected: module_tree and first_module_tree must be "
+                f"identical for consistent leaf/parent module collection. "
+                f"Modules only in current tree: {only_in_current or 'none'}. "
+                f"Modules only in first tree: {only_in_first or 'none'}. "
+                f"Current tree has {len(module_tree)} modules, first tree has {len(first_module_tree)} modules."
+            )
 
         if len(module_tree) > 0:
-            # Build dependency graph for parallel processing
-            dep_graph = self._build_dependency_graph(first_module_tree)
+            # Collect only leaf modules for parallel processing
+            leaf_modules = self._collect_leaf_modules_for_processing(module_tree, components, working_dir)
 
-            # Collect modules for parallel processing
-            modules = self._collect_modules_for_processing(module_tree, components, working_dir)
+            # Build dependency graph for leaf modules only (no dependencies between leaves)
+            leaf_dep_graph: Dict[str, List[str]] = {m["name"]: [] for m in leaf_modules}
 
-            # Define the async processing function for each module
-            async def process_single_module(module_info: Dict[str, Any]) -> Dict[str, Any]:
-                """Process a single module (leaf or parent)."""
-                module_key = module_info["name"]
+            # Define the async processing function for leaf modules only
+            async def process_leaf_module(module_info: Dict[str, Any]) -> Dict[str, Any]:
+                """Process a single leaf module via AgentOrchestrator."""
                 module_name = module_info["module_name"]
                 module_path = module_info["path"]
-                is_leaf = module_info["is_leaf"]
 
-                if is_leaf:
-                    return await self.agent_orchestrator.process_module(
-                        module_name,
-                        module_info["all_components"],
-                        module_info["components"],
-                        module_path,
-                        module_info["working_dir"],
-                    )
-                else:
-                    return await self.generate_parent_module_docs(
-                        module_path,
-                        module_info["working_dir"],
-                    )
+                return await self.agent_orchestrator.process_module(
+                    module_name,
+                    module_info["all_components"],
+                    module_info["components"],
+                    module_path,
+                    module_info["working_dir"],
+                )
 
-            # Process all modules in parallel (respecting dependencies)
-            self.logger.info(f"Processing {len(modules)} modules in parallel (max concurrency: {self.processor.max_concurrency})")
+            # Process all leaf modules in parallel
+            self.logger.info(f"Processing {len(leaf_modules)} leaf modules in parallel (max concurrency: {self.processor.max_concurrency})")
             try:
                 results = await self.processor.process_modules(
-                    modules=modules,
-                    dependency_graph=dep_graph,
-                    process_fn=process_single_module,
+                    modules=leaf_modules,
+                    dependency_graph=leaf_dep_graph,
+                    process_fn=process_leaf_module,
                 )
-                self.logger.success(f"Completed processing {len(results)} modules")
+                self.logger.success(f"Completed processing {len(results)} leaf modules")
             except ExceptionGroup as eg:
-                # Log failed modules but continue with successful ones
+                # Log failed modules and track them for partial success
                 for exc in eg.exceptions:
-                    self.logger.error(f"Module processing failed: {exc}")
+                    error_msg = f"Leaf module processing failed: {exc}"
+                    self.logger.error(error_msg)
+                    result.error_messages.append(error_msg)
+                    # Extract module name from exception if available
+                    exc_str = str(exc)
+                    result.failed_leaf_modules.append(exc_str[:100])  # Truncate for readability
+                result.partial_success = True
                 # Some modules may have succeeded despite the group failure
+
+            # Collect parent modules in bottom-up order (deepest first)
+            # Note: Use module_tree (same source as leaf collection) to ensure consistency
+            parent_module_paths = self._collect_parent_modules(module_tree)
+
+            # Process parent modules sequentially in bottom-up order
+            if parent_module_paths:
+                self.logger.info(f"Processing {len(parent_module_paths)} parent modules sequentially")
+                for module_path in parent_module_paths:
+                    module_name = module_path[-1]
+                    self.logger.info(f"Generating parent documentation for: {module_name}")
+                    try:
+                        await self.generate_parent_module_docs(module_path, working_dir)
+                    except Exception as e:
+                        error_msg = f"Parent module processing failed for {module_name}: {e}"
+                        self.logger.error(error_msg)
+                        result.failed_parent_modules.append(module_name)
+                        result.error_messages.append(error_msg)
+                        result.partial_success = True
+                        # Continue with other parent modules
 
             # Generate repo overview (depends on all modules, so process last)
             self.logger.info("Generating repository overview")
-            await self.generate_parent_module_docs([], working_dir)
+            try:
+                await self.generate_parent_module_docs([], working_dir)
+            except Exception as e:
+                error_msg = f"Repository overview generation failed: {e}"
+                self.logger.error(error_msg)
+                result.failed_parent_modules.append("repository_overview")
+                result.error_messages.append(error_msg)
+                result.partial_success = True
 
         else:
             self.logger.info("Processing whole repo because repo can fit in the context window")
-            repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
+            repo_name = os.path.basename(os.path.normpath(self.repo_path))
             await self.agent_orchestrator.process_module(
                 repo_name, components, leaf_nodes, [], working_dir
             )
@@ -329,12 +455,12 @@ class DocumentationGenerator:
             if os.path.exists(repo_overview_path):
                 os.rename(repo_overview_path, os.path.join(working_dir, OVERVIEW_FILENAME))
 
-        return working_dir
+        return result
 
     async def generate_parent_module_docs(self, module_path: List[str],
                                         working_dir: str) -> Dict[str, Any]:
         """Generate documentation for a parent module based on its children's documentation."""
-        module_name = module_path[-1] if len(module_path) >= 1 else os.path.basename(os.path.normpath(self.config.repo_path))
+        module_name = module_path[-1] if len(module_path) >= 1 else os.path.basename(os.path.normpath(self.repo_path))
 
         self.logger.info(f"Generating parent documentation for: {module_name}")
 
@@ -387,8 +513,12 @@ class DocumentationGenerator:
             self.logger.error(f"Error generating parent documentation for {module_name}: {str(e)}")
             raise
     
-    async def run(self) -> None:
-        """Run the complete documentation generation process using dynamic programming."""
+    async def run(self) -> GenerationResult:
+        """Run the complete documentation generation process using dynamic programming.
+
+        Returns:
+            GenerationResult with success/partial status and failure details.
+        """
         try:
             # Build dependency graph
             components, leaf_nodes = self.graph_builder.build_dependency_graph()
@@ -398,7 +528,7 @@ class DocumentationGenerator:
             # exit()
 
             # Cluster modules
-            working_dir = os.path.abspath(self.config.docs_dir)
+            working_dir = os.path.abspath(self.output_dir)
             file_manager.ensure_directory(working_dir)
             first_module_tree_path = os.path.join(working_dir, FIRST_MODULE_TREE_FILENAME)
             module_tree_path = os.path.join(working_dir, MODULE_TREE_FILENAME)
@@ -413,22 +543,36 @@ class DocumentationGenerator:
                     leaf_nodes, components, self.settings,
                     self.resilient_client, self.logger
                 )
+                # If clustering returned None (no clustering needed), use empty dict
+                if module_tree is None:
+                    module_tree = {}
                 file_manager.save_json(module_tree, first_module_tree_path)
 
             file_manager.save_json(module_tree, module_tree_path)
 
             self.logger.debug(f"Grouped components into {len(module_tree)} modules")
-            
+
             # Generate module documentation using dynamic programming approach
             # This processes leaf modules first, then parent modules
-            working_dir = await self.generate_module_documentation(components, leaf_nodes)
-            
-            # Create documentation metadata
-            self.create_documentation_metadata(working_dir, components, len(leaf_nodes))
+            result = await self.generate_module_documentation(components, leaf_nodes)
 
-            self.logger.debug(f"Documentation generation completed successfully using dynamic programming!")
-            self.logger.debug(f"Processing order: leaf modules → parent modules → repository overview")
-            self.logger.debug(f"Documentation saved to: {working_dir}")
+            # Create documentation metadata
+            self.create_documentation_metadata(result.output_dir, components, len(leaf_nodes))
+
+            # Log appropriate completion message based on result status
+            if result.partial_success:
+                self.logger.warning(result.status_message)
+                if result.failed_leaf_modules:
+                    self.logger.warning(f"Failed leaf modules: {len(result.failed_leaf_modules)}")
+                if result.failed_parent_modules:
+                    self.logger.warning(f"Failed parent modules: {result.failed_parent_modules}")
+            else:
+                self.logger.debug("Documentation generation completed successfully using dynamic programming!")
+
+            self.logger.debug("Processing order: leaf modules → parent modules → repository overview")
+            self.logger.debug(f"Documentation saved to: {result.output_dir}")
+
+            return result
 
         except Exception as e:
             self.logger.error(f"Documentation generation failed: {str(e)}")

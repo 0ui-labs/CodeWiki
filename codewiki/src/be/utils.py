@@ -1,12 +1,11 @@
 import re
 from pathlib import Path
-from typing import List, Tuple
-import logging
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from codewiki.core.llm.tokenizers import TokenCounter
 
-
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from codewiki.core.logging import CodeWikiLogger
 
 # ------------------------------------------------------------
 # ---------------------- Complexity Check --------------------
@@ -46,13 +45,19 @@ def count_tokens(text: str, model: str = "gpt-4") -> int:
 # ---------------------- Mermaid Validation -----------------
 # ------------------------------------------------------------
 
-async def validate_mermaid_diagrams(md_file_path: str, relative_path: str) -> str:
+async def validate_mermaid_diagrams(
+    md_file_path: str,
+    relative_path: str,
+    logger: Optional["CodeWikiLogger"] = None,
+) -> str:
     """
     Validate all Mermaid diagrams in a markdown file.
-    
+
     Args:
         md_file_path: Path to the markdown file to check
         relative_path: Relative path to the markdown file
+        logger: Optional CodeWikiLogger instance for logging warnings/errors.
+                If None, logging is skipped.
     Returns:
         "All mermaid diagrams are syntax correct" if all diagrams are valid,
         otherwise returns error message with details about invalid diagrams
@@ -75,7 +80,7 @@ async def validate_mermaid_diagrams(md_file_path: str, relative_path: str) -> st
         # Validate each mermaid diagram sequentially to avoid segfaults
         errors = []
         for i, (line_start, diagram_content) in enumerate(mermaid_blocks, 1):
-            error_msg = await validate_single_diagram(diagram_content, i, line_start)
+            error_msg = await validate_single_diagram(diagram_content, i, line_start, logger)
             if error_msg:
                 errors.append("\n")
                 errors.append(error_msg)
@@ -128,15 +133,22 @@ def extract_mermaid_blocks(content: str) -> List[Tuple[int, str]]:
     return mermaid_blocks
 
 
-async def validate_single_diagram(diagram_content: str, diagram_num: int, line_start: int) -> str:
+async def validate_single_diagram(
+    diagram_content: str,
+    diagram_num: int,
+    line_start: int,
+    logger: Optional["CodeWikiLogger"] = None,
+) -> str:
     """
     Validate a single mermaid diagram.
-    
+
     Args:
         diagram_content: The mermaid diagram content
         diagram_num: Diagram number for error reporting
         line_start: Starting line number in the file
-        
+        logger: Optional CodeWikiLogger instance for logging warnings/errors.
+                If None, logging is skipped.
+
     Returns:
         Error message if invalid, empty string if valid
     """
@@ -173,11 +185,13 @@ async def validate_single_diagram(diagram_content: str, diagram_num: int, line_s
                 core_error = match.group(0).strip()
                 core_error = core_error
             else:
-                logger.error(f"No match found for error pattern, fallback to mermaid-py\n{error_str}")
+                if logger:
+                    logger.error(f"No match found for error pattern, fallback to mermaid-py\n{error_str}")
                 raise Exception(error_str)
 
     except Exception as e:
-        logger.warning("Using mermaid-py to validate mermaid diagrams")
+        if logger:
+            logger.warning("Using mermaid-py to validate mermaid diagrams")
         try:
             import mermaid as md
             # Create Mermaid object and check response

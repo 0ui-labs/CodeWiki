@@ -123,10 +123,20 @@ def demo_note_about_tools():
     print("Note: Tool Call Support")
     print("=" * 80)
     print("""
-CodeWikiModel currently does NOT support tool calls from the LLM because
-ResilientLLMClient only returns text content.
+CodeWikiModel supports tool calls for pydantic_ai Agents. Tools are:
+- Extracted from model_request_parameters.function_tools
+- Converted to provider-specific format (Anthropic vs OpenAI)
+- Passed to LLMClient.complete() via the tools parameter
+- Parsed from responses and returned as ToolCallPart objects
 
-You can define tools on the Agent, but the LLM won't call them. Example:
+Supported providers:
+- Anthropic (Claude models): Full tool support
+- OpenAI (GPT, o1, o3 models): Full tool support
+- Groq (OpenAI-compatible): Full tool support
+- Cerebras (OpenAI-compatible): Full tool support
+- Google (Gemini models): Not yet supported
+
+Example usage:
 
     from pydantic_ai import RunContext
 
@@ -134,12 +144,7 @@ You can define tools on the Agent, but the LLM won't call them. Example:
     def get_user_info(ctx: RunContext[str], user_id: str) -> str:
         return f"User {user_id} info"
 
-    # This won't trigger tool calls from the LLM yet
-
-To enable tool support:
-1. Extend LLMClient to parse tool_use blocks from provider responses
-2. Update LLMResponse to include tool_calls: list[ToolCall]
-3. Update CodeWikiModel.request() to convert to ToolCallPart objects
+    # The LLM will now call this tool when appropriate
 
 See codewiki/src/be/llm_adapter.py for implementation details.
     """)

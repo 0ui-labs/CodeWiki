@@ -4,7 +4,7 @@ import os
 from typing import Dict, List, Any
 
 # Local imports
-from codewiki.core import Settings
+from codewiki.core import Settings, MODULE_TREE_FILENAME, OVERVIEW_FILENAME
 from codewiki.core.logging import get_logger
 from codewiki.src.be.llm_adapter import CodeWikiModel
 from codewiki.src.be.agent_tools.deps import CodeWikiDeps
@@ -17,10 +17,6 @@ from codewiki.src.be.prompt_template import (
     format_user_prompt,
 )
 from codewiki.src.be.utils import is_complex_module
-from codewiki.src.config import (
-    MODULE_TREE_FILENAME,
-    OVERVIEW_FILENAME,
-)
 from codewiki.src.utils import file_manager
 from codewiki.src.be.dependency_analyzer.models.core import Node
 
@@ -119,7 +115,7 @@ class AgentOrchestrator:
 
             # Save updated module tree
             file_manager.save_json(deps.module_tree, module_tree_path)
-            self.logger.debug(f"Successfully processed module: {module_name}")
+            self.logger.success(f"Successfully processed module: {module_name}")
 
             return deps.module_tree
 

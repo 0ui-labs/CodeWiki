@@ -1,12 +1,11 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
 
 from codewiki.src.be.dependency_analyzer.models.core import Node
-from codewiki.core import Settings
+from codewiki.core import Settings, MAX_TOKEN_PER_MODULE
 from codewiki.core.llm import ResilientLLMClient
 from codewiki.core.llm.tokenizers import TokenCounter
 from codewiki.core.logging import CodeWikiLogger
-from codewiki.src.config import MAX_TOKEN_PER_MODULE
 from codewiki.src.be.prompt_template import format_cluster_prompt
 
 
@@ -51,15 +50,21 @@ async def cluster_modules(
     current_module_tree: dict[str, Any] = {},
     current_module_name: str = None,
     current_module_path: List[str] = []
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
     Cluster the potential core components into modules.
+
+    Returns:
+        A dict representing the module tree if clustering was performed,
+        or None if no clustering occurred (e.g., token count below threshold,
+        invalid LLM response, or resulting module tree too small). Callers
+        should check for None to avoid overwriting existing module structures.
     """
     potential_core_components, potential_core_components_with_code = format_potential_core_components(
         leaf_nodes, components, logger
     )
 
-    token_counter = TokenCounter(settings)
+    token_counter = TokenCounter()
     model = settings.cluster_model or settings.main_model
     token_count = token_counter.count(potential_core_components_with_code, model)
 
@@ -68,7 +73,7 @@ async def cluster_modules(
             f"Skipping clustering for {current_module_name} because the potential core components "
             f"are too few: {token_count} tokens"
         )
-        return {}
+        return None
 
     prompt = format_cluster_prompt(potential_core_components, current_module_tree, current_module_name)
 
@@ -84,7 +89,7 @@ async def cluster_modules(
     try:
         if "<GROUPED_COMPONENTS>" not in response or "</GROUPED_COMPONENTS>" not in response:
             logger.error(f"Invalid LLM response format - missing component tags: {response[:200]}...")
-            return {}
+            return None
 
         response_content = response.split("<GROUPED_COMPONENTS>")[1].split("</GROUPED_COMPONENTS>")[0]
         # Use ast.literal_eval for safe parsing (no arbitrary code execution)
@@ -93,16 +98,16 @@ async def cluster_modules(
         
         if not isinstance(module_tree, dict):
             logger.error(f"Invalid module tree format - expected dict, got {type(module_tree)}")
-            return {}
-            
+            return None
+
     except Exception as e:
         logger.error(f"Failed to parse LLM response: {e}. Response: {response[:200]}...")
-        return {}
+        return None
 
     # check if the module tree is valid
     if len(module_tree) <= 1:
         logger.debug(f"Skipping clustering for {current_module_name} because the module tree is too small: {len(module_tree)} modules")
-        return {}
+        return None
 
     if current_module_tree == {}:
         current_module_tree = module_tree
@@ -127,7 +132,7 @@ async def cluster_modules(
         
         current_module_path.append(module_name)
         module_info["children"] = {}
-        module_info["children"] = await cluster_modules(
+        sub_module_tree = await cluster_modules(
             valid_sub_leaf_nodes,
             components,
             settings,
@@ -137,6 +142,9 @@ async def cluster_modules(
             module_name,
             current_module_path
         )
+        # Only update children if clustering produced a result
+        if sub_module_tree is not None:
+            module_info["children"] = sub_module_tree
         current_module_path.pop()
 
     return module_tree

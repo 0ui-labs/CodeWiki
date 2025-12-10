@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_file: str | None = None
 
+    # Repository context (set by Config.to_core_settings())
+    repo_path: str | None = None
+    max_depth: int = 2
+
     @field_validator("main_model")
     @classmethod
     def validate_model(cls, v: str) -> str:

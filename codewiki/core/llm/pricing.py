@@ -1,101 +1,85 @@
-"""LLM pricing module for cost tracking.
+"""Legacy LLM pricing module - thin wrapper around costs.py.
 
-This module provides pricing information for various LLM models and calculates
-the cost of API calls based on token usage.
+This module provides backwards-compatible exports for existing code that imports
+from ``codewiki.core.llm.pricing``. New code should import from
+``codewiki.core.llm.costs`` directly.
 
-All prices are per 1 million tokens (as of December 2025).
+All pricing data is defined in ``costs.py`` as the single source of truth.
 """
 
-from typing import Dict
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Dict
+
+from .costs import PRICING, calculate_cost as _calculate_cost_new
+
+if TYPE_CHECKING:
+    from codewiki.core.logging import CodeWikiLogger
+
+# Module-level logger for fallback when no CodeWikiLogger is available
+_logger = logging.getLogger(__name__)
 
 # Default pricing for unknown models (per 1M tokens)
-DEFAULT_PRICING = {
+# Used for backwards compatibility with code expecting these constants
+DEFAULT_PRICING: Dict[str, float] = {
     "input": 5.00,
     "output": 15.00,
 }
 
-# Model pricing per 1 million tokens
-# Prices are current as of December 2025
+# Backwards-compatible MODEL_PRICING dict built from costs.py PRICING
+# This converts the typed ModelPricing dataclass to the legacy dict format
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
-    # Anthropic Claude models
-    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00},
-    "claude-sonnet-4-5-20251101": {"input": 3.00, "output": 15.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
-    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
-    "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
-    "claude-3-sonnet-20240229": {"input": 3.00, "output": 15.00},
-    "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
-    # OpenAI GPT models
-    "gpt-4o": {"input": 5.00, "output": 20.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4.1": {"input": 2.00, "output": 8.00},
-    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
-    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
-    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
-    "gpt-4": {"input": 30.00, "output": 60.00},
-    "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
-    # OpenAI reasoning models
-    "o1": {"input": 15.00, "output": 60.00},
-    "o1-mini": {"input": 3.00, "output": 12.00},
-    "o1-preview": {"input": 15.00, "output": 60.00},
-    "o3": {"input": 1.00, "output": 4.00},
-    "o3-mini": {"input": 1.10, "output": 4.40},
-    # Google Gemini models
-    "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
-    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
-    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
-    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
-    "gemini-2.0-flash-lite": {"input": 0.02, "output": 0.10},
-    "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
-    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
-    "gemini-pro": {"input": 0.50, "output": 1.50},
-    # Groq models
-    "groq/llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
-    "groq/llama-3.1-70b-versatile": {"input": 0.59, "output": 0.79},
-    "groq/llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
-    "groq/llama3-70b-8192": {"input": 0.59, "output": 0.79},
-    "groq/llama3-8b-8192": {"input": 0.05, "output": 0.08},
-    "groq/mixtral-8x7b-32768": {"input": 0.24, "output": 0.24},
-    "groq/gemma2-9b-it": {"input": 0.20, "output": 0.20},
-    # Cerebras models
-    "cerebras/llama3.1-8b": {"input": 0.10, "output": 0.10},
-    "cerebras/llama3.1-70b": {"input": 0.60, "output": 0.60},
-    "cerebras/llama3.1-405b": {"input": 6.00, "output": 12.00},
+    model: {"input": pricing.input_per_million, "output": pricing.output_per_million}
+    for model, pricing in PRICING.items()
 }
 
 
-def get_model_pricing(model: str) -> Dict[str, float]:
-    """
-    Get pricing information for a specific model.
+def get_model_pricing(model: str, logger: "CodeWikiLogger | None" = None) -> Dict[str, float]:
+    """Get pricing information for a specific model.
 
     Args:
         model: Model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-20250514')
+        logger: Optional CodeWikiLogger for warning about unknown models
 
     Returns:
         Dictionary with 'input' and 'output' pricing per 1M tokens.
         Returns default pricing for unknown models.
     """
-    pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
-    # Return a copy to prevent accidental modification
-    return pricing.copy()
+    pricing = PRICING.get(model)
+
+    if pricing is None:
+        # Log warning about unknown model
+        warning_msg = (
+            f"Unknown model '{model}' - using default pricing "
+            f"(${DEFAULT_PRICING['input']:.2f}/${DEFAULT_PRICING['output']:.2f} per 1M tokens)"
+        )
+        if logger is not None:
+            logger.warning(warning_msg, model=model)
+        else:
+            _logger.warning(warning_msg)
+
+        return DEFAULT_PRICING.copy()
+
+    return {"input": pricing.input_per_million, "output": pricing.output_per_million}
 
 
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """
-    Calculate the cost of an LLM API call.
+def calculate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    logger: "CodeWikiLogger | None" = None,
+) -> float:
+    """Calculate the cost of an LLM API call.
 
     Args:
         model: Model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-20250514')
         input_tokens: Number of input/prompt tokens
         output_tokens: Number of output/completion tokens
+        logger: Optional logger for warnings about unknown models
 
     Returns:
-        Total cost in USD
-
-    Raises:
-        ValueError: If token counts are negative
+        Total cost in USD. Returns 0.0 for unknown models.
 
     Example:
         >>> calculate_cost("gpt-4o-mini", 1_000_000, 500_000)
@@ -103,13 +87,25 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         >>> calculate_cost("claude-sonnet-4-20250514", 1000, 500)
         0.0105
     """
-    if input_tokens < 0 or output_tokens < 0:
-        raise ValueError("Token counts cannot be negative")
+    pricing = PRICING.get(model)
 
-    pricing = get_model_pricing(model)
+    if pricing is None:
+        # Log warning about unknown model - matches costs.py behavior
+        if logger is not None:
+            logger.warning(
+                f"Unknown model '{model}' - cannot calculate cost",
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        else:
+            _logger.warning(
+                "Unknown model '%s' - cannot calculate cost (input_tokens=%d, output_tokens=%d)",
+                model,
+                input_tokens,
+                output_tokens,
+            )
+        return 0.0
 
-    # Calculate cost based on pricing per 1M tokens
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
-
-    return input_cost + output_cost
+    # Delegate to costs.py for known models
+    return _calculate_cost_new(model, input_tokens, output_tokens, logger)

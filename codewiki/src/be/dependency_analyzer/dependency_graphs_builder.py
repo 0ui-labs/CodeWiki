@@ -1,6 +1,5 @@
 from typing import Dict, List, Any
 import os
-from codewiki.src.config import Config
 from codewiki.src.be.dependency_analyzer.ast_parser import DependencyParser
 from codewiki.src.be.dependency_analyzer.topo_sort import build_graph_from_components, get_leaf_nodes
 from codewiki.src.utils import file_manager
@@ -11,33 +10,41 @@ logger = logging.getLogger(__name__)
 
 class DependencyGraphBuilder:
     """Handles dependency analysis and graph building."""
-    
-    def __init__(self, config: Config):
-        self.config = config
+
+    def __init__(self, repo_path: str, dependency_graph_dir: str):
+        """
+        Initialize dependency graph builder.
+
+        Args:
+            repo_path: Path to repository to analyze
+            dependency_graph_dir: Directory to save dependency graphs
+        """
+        self.repo_path = repo_path
+        self.dependency_graph_dir = dependency_graph_dir
     
     def build_dependency_graph(self) -> tuple[Dict[str, Any], List[str]]:
         """
         Build and save dependency graph, returning components and leaf nodes.
-        
+
         Returns:
             Tuple of (components, leaf_nodes)
         """
         # Ensure output directory exists
-        file_manager.ensure_directory(self.config.dependency_graph_dir)
+        file_manager.ensure_directory(self.dependency_graph_dir)
 
         # Prepare dependency graph path
-        repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
+        repo_name = os.path.basename(os.path.normpath(self.repo_path))
         sanitized_repo_name = ''.join(c if c.isalnum() else '_' for c in repo_name)
         dependency_graph_path = os.path.join(
-            self.config.dependency_graph_dir, 
+            self.dependency_graph_dir,
             f"{sanitized_repo_name}_dependency_graph.json"
         )
         filtered_folders_path = os.path.join(
-            self.config.dependency_graph_dir, 
+            self.dependency_graph_dir,
             f"{sanitized_repo_name}_filtered_folders.json"
         )
 
-        parser = DependencyParser(self.config.repo_path)
+        parser = DependencyParser(self.repo_path)
 
         filtered_folders = None
         # if os.path.exists(filtered_folders_path):

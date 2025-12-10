@@ -2,8 +2,7 @@
 Configuration data models for CodeWiki CLI.
 
 This module contains the Configuration class which represents persistent
-user settings stored in ~/.codewiki/config.json. These settings are converted
-to the backend Config class when running documentation generation.
+user settings stored in ~/.codewiki/config.json.
 """
 
 from dataclasses import dataclass, asdict
@@ -69,34 +68,7 @@ class Configuration:
     def is_complete(self) -> bool:
         """Check if all required fields are set."""
         return bool(
-            self.base_url and 
-            self.main_model and 
+            self.base_url and
+            self.main_model and
             self.cluster_model
         )
-    
-    def to_backend_config(self, repo_path: str, output_dir: str, api_key: str):
-        """
-        Convert CLI Configuration to Backend Config.
-        
-        This method bridges the gap between persistent user settings (CLI Configuration)
-        and runtime job configuration (Backend Config).
-        
-        Args:
-            repo_path: Path to the repository to document
-            output_dir: Output directory for generated documentation
-            api_key: LLM API key (from keyring)
-            
-        Returns:
-            Backend Config instance ready for documentation generation
-        """
-        from codewiki.src.config import Config
-        
-        return Config.from_cli(
-            repo_path=repo_path,
-            output_dir=output_dir,
-            llm_base_url=self.base_url,
-            llm_api_key=api_key,
-            main_model=self.main_model,
-            cluster_model=self.cluster_model
-        )
-

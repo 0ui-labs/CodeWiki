@@ -288,6 +288,33 @@ class ResilientLLMClient:
             message=error_msg,
         )
 
+    async def close(self) -> None:
+        """Close the underlying LLM client and release resources.
+
+        This method delegates to the inner LLMClient's close() method,
+        ensuring all provider connections (Anthropic, OpenAI, etc.) are
+        properly closed.
+
+        This method is idempotent and can be called multiple times safely.
+
+        Example:
+            >>> resilient = ResilientLLMClient(client, config, logger)
+            >>> try:
+            ...     response = await resilient.complete(messages, model)
+            ... finally:
+            ...     await resilient.close()
+        """
+        await self.client.close()
+
+    async def __aenter__(self) -> "ResilientLLMClient":
+        """Async context manager entry - returns self."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """Async context manager exit - closes the client."""
+        await self.close()
+        return False  # Don't suppress exceptions
+
     def _calculate_backoff(
         self,
         attempt: int,

@@ -15,6 +15,7 @@ class JobStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
 
 
@@ -81,6 +82,8 @@ class DocumentationJob:
     generation_options: GenerationOptions = field(default_factory=GenerationOptions)
     llm_config: Optional[LLMConfig] = None
     statistics: JobStatistics = field(default_factory=JobStatistics)
+    failed_modules: List[str] = field(default_factory=list)
+    warning_message: Optional[str] = None
     
     def start(self):
         """Mark job as started."""
@@ -91,7 +94,19 @@ class DocumentationJob:
         """Mark job as completed."""
         self.status = JobStatus.COMPLETED
         self.timestamp_end = datetime.now().isoformat()
-    
+
+    def partial_complete(self, warning_message: str, failed_modules: List[str]):
+        """Mark job as partially completed with some module failures.
+
+        Args:
+            warning_message: Summary of what failed
+            failed_modules: List of module names that failed
+        """
+        self.status = JobStatus.PARTIAL_SUCCESS
+        self.warning_message = warning_message
+        self.failed_modules = failed_modules
+        self.timestamp_end = datetime.now().isoformat()
+
     def fail(self, error_message: str):
         """Mark job as failed."""
         self.status = JobStatus.FAILED
@@ -111,11 +126,13 @@ class DocumentationJob:
             "timestamp_end": self.timestamp_end,
             "status": self.status.value if isinstance(self.status, JobStatus) else self.status,
             "error_message": self.error_message,
+            "warning_message": self.warning_message,
             "files_generated": self.files_generated,
             "module_count": self.module_count,
             "generation_options": asdict(self.generation_options),
             "llm_config": asdict(self.llm_config) if self.llm_config else None,
             "statistics": asdict(self.statistics),
+            "failed_modules": self.failed_modules,
         }
         return data
     
@@ -137,8 +154,10 @@ class DocumentationJob:
             timestamp_end=data.get('timestamp_end'),
             status=JobStatus(data.get('status', 'pending')),
             error_message=data.get('error_message'),
+            warning_message=data.get('warning_message'),
             files_generated=data.get('files_generated', []),
             module_count=data.get('module_count', 0),
+            failed_modules=data.get('failed_modules', []),
         )
         
         # Parse nested objects

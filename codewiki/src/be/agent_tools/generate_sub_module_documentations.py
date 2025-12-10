@@ -7,7 +7,7 @@ from codewiki.src.be.llm_adapter import CodeWikiModel
 from codewiki.src.be.prompt_template import SYSTEM_PROMPT, LEAF_SYSTEM_PROMPT, format_user_prompt
 from codewiki.src.be.utils import is_complex_module, count_tokens
 from codewiki.src.be.cluster_modules import format_potential_core_components
-from codewiki.src.config import MAX_TOKEN_PER_LEAF_MODULE
+from codewiki.core import MAX_TOKEN_PER_LEAF_MODULE
 from codewiki.core.logging import get_logger
 
 

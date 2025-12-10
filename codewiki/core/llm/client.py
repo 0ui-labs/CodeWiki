@@ -42,7 +42,9 @@ except ImportError:
 
 from codewiki.core.config import Settings
 from codewiki.core.llm.tokenizers import TokenCounter, MODEL_CONTEXT_LIMITS
-from codewiki.core.llm.pricing import calculate_cost
+from codewiki.core.llm.costs import calculate_cost
+from codewiki.core.llm.pricing_provider import PricingProvider
+from codewiki.core.llm.utils import detect_provider
 from codewiki.core.errors import (
     LLMError,
     RateLimitError,
@@ -153,6 +155,9 @@ class LLMClient:
         self.token_counter = token_counter if token_counter is not None else TokenCounter(settings)
         self._logger = logger
 
+        # Initialize pricing provider (fetches from LiteLLM if cache is stale)
+        self._pricing_provider = PricingProvider(logger=logger)
+
         # Lazy-loaded provider clients
         self._anthropic: Optional[AsyncAnthropic] = None
         self._openai: Optional[AsyncOpenAI] = None
@@ -240,10 +245,16 @@ class LLMClient:
             temperature: Sampling temperature (default: 0.0)
             max_tokens: Maximum tokens to generate (default: 4096)
             timeout: Request timeout in seconds (default: 60.0)
-            **kwargs: Additional provider-specific parameters
+            **kwargs: Additional provider-specific parameters, including:
+                - tools: List of tool definitions for function calling.
+                  Format depends on provider:
+                  - Anthropic: [{"name": str, "description": str, "input_schema": dict}]
+                  - OpenAI/Groq/Cerebras: [{"type": "function", "function": {...}}]
+                  If provided, the LLM may return tool_calls in the response.
+                  Google Gemini does not currently support tools via this interface.
 
         Returns:
-            LLMResponse with content and token usage
+            LLMResponse with content, token usage, and tool_calls (if any)
 
         Raises:
             ContextLengthError: If input exceeds model's context window
@@ -283,26 +294,15 @@ class LLMClient:
         """
         Detect provider from model name.
 
+        Uses the centralized detect_provider function from codewiki.core.llm.utils.
+
         Args:
             model: Model name
 
         Returns:
-            Provider name: 'anthropic', 'openai', 'google', 'groq', 'cerebras'
+            Provider name: 'anthropic', 'openai', 'google', 'groq', 'cerebras', or 'unknown'
         """
-        model_lower = model.lower()
-
-        if model_lower.startswith("claude-"):
-            return "anthropic"
-        elif model_lower.startswith(("gpt-", "o1-", "o3-")):
-            return "openai"
-        elif model_lower.startswith("gemini-"):
-            return "google"
-        elif model_lower.startswith("groq/"):
-            return "groq"
-        elif model_lower.startswith("cerebras/"):
-            return "cerebras"
-        else:
-            return "unknown"
+        return detect_provider(model)
 
     def _messages_to_text(self, messages: list[dict]) -> str:
         """
@@ -465,7 +465,7 @@ class LLMClient:
 
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
-            cost = calculate_cost(model, input_tokens, output_tokens)
+            cost = calculate_cost(model, input_tokens, output_tokens, pricing_provider=self._pricing_provider)
 
             return LLMResponse(
                 content=content,
@@ -536,7 +536,7 @@ class LLMClient:
 
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
-            cost = calculate_cost(model, input_tokens, output_tokens)
+            cost = calculate_cost(model, input_tokens, output_tokens, pricing_provider=self._pricing_provider)
 
             return LLMResponse(
                 content=content,
@@ -601,7 +601,7 @@ class LLMClient:
 
             input_tokens = response.usage_metadata.prompt_token_count
             output_tokens = response.usage_metadata.candidates_token_count
-            cost = calculate_cost(model, input_tokens, output_tokens)
+            cost = calculate_cost(model, input_tokens, output_tokens, pricing_provider=self._pricing_provider)
 
             return LLMResponse(
                 content=response.text,
@@ -675,7 +675,7 @@ class LLMClient:
 
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
-            cost = calculate_cost(model, input_tokens, output_tokens)
+            cost = calculate_cost(model, input_tokens, output_tokens, pricing_provider=self._pricing_provider)
 
             return LLMResponse(
                 content=content,
@@ -750,7 +750,7 @@ class LLMClient:
 
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
-            cost = calculate_cost(model, input_tokens, output_tokens)
+            cost = calculate_cost(model, input_tokens, output_tokens, pricing_provider=self._pricing_provider)
 
             return LLMResponse(
                 content=content,

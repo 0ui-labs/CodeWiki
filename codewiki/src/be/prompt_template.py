@@ -137,7 +137,7 @@ Firstly reason about the components and then group them and return the result in
 <GROUPED_COMPONENTS>
 {{
     "module_name_1": {{
-        "path": <path_to_the_module_1>, # the path to the module can be file or directory
+        "path": <path_to_the_module_1>, # relative path to directory or file; file paths are normalized to their parent directory
         "components": [
             <component_name_1>,
             <component_name_2>,
@@ -175,7 +175,7 @@ Firstly reason based on given context and then group them and return the result 
 <GROUPED_COMPONENTS>
 {{
     "module_name_1": {{
-        "path": <path_to_the_module_1>, # the path to the module can be file or directory
+        "path": <path_to_the_module_1>, # relative path to directory or file; file paths are normalized to their parent directory
         "components": [
             <component_name_1>,
             <component_name_2>,

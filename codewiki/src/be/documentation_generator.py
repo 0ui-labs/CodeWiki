@@ -34,11 +34,16 @@ class GenerationResult:
 
 # Local imports
 from codewiki.src.be.dependency_analyzer import DependencyGraphBuilder
+from codewiki.src.be.dependency_analyzer.models.core import Node
 from codewiki.src.be.prompt_template import (
     REPO_OVERVIEW_PROMPT,
     MODULE_OVERVIEW_PROMPT,
 )
-from codewiki.src.be.cluster_modules import cluster_modules
+from codewiki.src.be.cluster_modules import (
+    cluster_modules,
+    compute_module_tree_hashes,
+    _enrich_module_metadata,
+)
 from codewiki.src.utils import file_manager
 from codewiki.src.be.agent_orchestrator import AgentOrchestrator
 
@@ -51,7 +56,7 @@ from codewiki.core import (
     OVERVIEW_FILENAME,
 )
 from codewiki.core.llm import ResilientLLMClient, LLMClient, RetryConfig
-from codewiki.core.logging import CodeWikiLogger, get_logger
+from codewiki.core.logging import get_logger
 
 
 class DocumentationGenerator:
@@ -231,6 +236,102 @@ class DocumentationGenerator:
         for node in graph:
             if color[node] == WHITE:
                 dfs(node, [])
+
+    def _validate_mcp_metadata(self, tree: Dict[str, Any], path: List[str] = None) -> None:
+        """Validate MCP metadata presence in module tree.
+
+        Recursively checks that all modules have required MCP fields:
+        - path: Module path in tree
+        - type: Module type
+        - hash: Content hash
+        - components: List of components
+        - children: Child modules
+
+        Args:
+            tree: Module tree to validate
+            path: Current path in tree (used for recursive calls)
+        """
+        if path is None:
+            path = []
+
+        for name, info in tree.items():
+            current_path = "/".join(path + [name])
+            required_fields = ["path", "type", "hash", "components", "children"]
+            missing = [f for f in required_fields if f not in info]
+            if missing:
+                self.logger.warning(f"Module {current_path} missing MCP fields: {missing}")
+
+            if info.get("children"):
+                self._validate_mcp_metadata(info["children"], path + [name])
+
+    def _needs_mcp_migration(self, tree: Dict[str, Any], path: List[str] = None) -> bool:
+        """Check if any module in tree is missing required MCP fields.
+
+        Recursively checks that all modules have required MCP fields:
+        - path: Module path in tree
+        - type: Module type
+        - hash: Content hash
+        - components: List of components
+        - children: Child modules
+
+        Args:
+            tree: Module tree to check
+            path: Current path in tree (used for recursive calls)
+
+        Returns:
+            True if any module is missing MCP fields, False otherwise.
+        """
+        if path is None:
+            path = []
+
+        required_fields = ["path", "type", "hash", "components", "children"]
+
+        for name, info in tree.items():
+            missing = [f for f in required_fields if f not in info]
+            if missing:
+                return True
+
+            if info.get("children") and isinstance(info["children"], dict):
+                if self._needs_mcp_migration(info["children"], path + [name]):
+                    return True
+
+        return False
+
+    def _migrate_legacy_module_tree(
+        self,
+        tree: Dict[str, Any],
+        components: Dict[str, Node],
+    ) -> None:
+        """Enrich legacy module tree with MCP metadata in-place.
+
+        Recursively iterates over all modules and uses _enrich_module_metadata()
+        to add missing MCP fields (path, type, hash, components, children)
+        without overwriting existing correct values.
+
+        Args:
+            tree: Module tree to migrate (modified in-place)
+            components: All code components for path inference
+        """
+        for module_name, module_info in tree.items():
+            # Ensure 'components' and 'children' fields exist
+            if "components" not in module_info:
+                module_info["components"] = []
+            if "children" not in module_info:
+                module_info["children"] = {}
+
+            # Use _enrich_module_metadata to add path, type, hash
+            # This function preserves existing non-empty values
+            _enrich_module_metadata(
+                module_info,
+                components,
+                self.repo_path,
+                self.logger
+            )
+
+            # Recursively process children
+            children = module_info.get("children", {})
+            if children and isinstance(children, dict):
+                self._migrate_legacy_module_tree(children, components)
 
     def build_overview_structure(self, module_tree: Dict[str, Any], module_path: List[str],
                                  working_dir: str) -> Dict[str, Any]:
@@ -537,6 +638,21 @@ class DocumentationGenerator:
             if os.path.exists(first_module_tree_path):
                 self.logger.debug(f"Module tree found at {first_module_tree_path}")
                 module_tree = file_manager.load_json(first_module_tree_path)
+
+                # Migration: Check if legacy tree needs MCP metadata enrichment
+                if module_tree and self._needs_mcp_migration(module_tree):
+                    self.logger.info(
+                        "Legacy module tree detected - migrating to MCP-compatible format "
+                        "(adding path, type, hash, components, children fields)"
+                    )
+                    self._migrate_legacy_module_tree(module_tree, components)
+                    # Save migrated tree to both files for consistency
+                    file_manager.save_json(module_tree, first_module_tree_path)
+                    file_manager.save_json(module_tree, module_tree_path)
+                    self.logger.info(
+                        f"Migration complete - updated {FIRST_MODULE_TREE_FILENAME} and "
+                        f"{MODULE_TREE_FILENAME} with MCP metadata"
+                    )
             else:
                 self.logger.debug(f"Module tree not found at {module_tree_path}, clustering modules")
                 module_tree = await cluster_modules(
@@ -548,7 +664,18 @@ class DocumentationGenerator:
                     module_tree = {}
                 file_manager.save_json(module_tree, first_module_tree_path)
 
+            # Compute Merkle-style hashes for all modules (bottom-up: children first, then parents)
+            # This populates the 'hash' field with content-based hashes for change detection
+            if module_tree:
+                self.logger.debug("Computing module tree hashes...")
+                compute_module_tree_hashes(module_tree, components, self.logger)
+                self.logger.debug("Module tree hashes computed successfully")
+
             file_manager.save_json(module_tree, module_tree_path)
+
+            # Validate MCP metadata presence
+            self._validate_mcp_metadata(module_tree)
+            self.logger.debug("Module tree validated with MCP metadata (path, type, hash)")
 
             self.logger.debug(f"Grouped components into {len(module_tree)} modules")
 
